@@ -9,6 +9,7 @@ use std::sync::{
 use crate::model::EnvironmentState;
 use crate::registry::{CapabilityRegistry, ToolRegistry};
 
+use super::assessment::AssessmentState;
 use super::context::{ContextManager, Finding};
 use super::events::AgentEvent;
 use super::executor::{LocalProcessExecutor, ProcessExecutor, ToolResult};
@@ -92,6 +93,13 @@ impl RuntimeHandle {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// The shared cancel flag, for components that must react to a Stop
+    /// without a reference to the whole handle — notably the process
+    /// executor, which kills the in-flight child when this flips.
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
 }
 
 pub struct AgentRuntime<'a> {
@@ -127,6 +135,23 @@ pub struct AgentRuntime<'a> {
     /// Blocking approval gate for interactive UIs (see
     /// [`AgentRuntime::with_approval_gate`]). `None` in headless/CLI runs.
     approval_gate: Option<std::sync::Arc<std::sync::Mutex<Option<bool>>>>,
+    /// Debug-trace sink (see `infra::trace`). `None` = tracing off (tests,
+    /// headless runs without a session file). When set, every LLM call,
+    /// decision, tool invocation and state mutation is appended as JSONL.
+    tracer: std::cell::RefCell<Option<Box<dyn FnMut(crate::infra::trace::TraceEntry) + Send>>>,
+    /// Drained at each step boundary in `drive()`: returns user messages
+    /// that arrived mid-turn. They are folded into the SAME turn — appended
+    /// to the conversation and run through scope-granting — so the next
+    /// model call sees them and adapts, instead of the turn stopping and a
+    /// fresh turn starting. `None` in CLI/headless runs: no live mailbox.
+    input_drain: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
+    /// Consulted at each step boundary in `drive()`: returns a replacement
+    /// model provider when the operator switched providers mid-turn, else
+    /// `None`. The swap is applied BEFORE the next LLM request, so a
+    /// provider change takes effect on the very next step (like Claude
+    /// Code / Codex) instead of waiting for the whole turn to end. `None`
+    /// in CLI/headless runs: no live provider switch.
+    model_reload: Option<Arc<dyn Fn() -> Option<Box<dyn ModelProvider>> + Send + Sync>>,
 }
 
 impl<'a> AgentRuntime<'a> {
@@ -159,7 +184,21 @@ impl<'a> AgentRuntime<'a> {
             providers,
             executor: None,
             approval_gate: None,
+            tracer: std::cell::RefCell::new(None),
+            input_drain: None,
+            model_reload: None,
         }
+    }
+
+    /// Attach a debug-trace sink (per-session JSONL writer). The sink is
+    /// `Send` so runtimes keep working on worker threads; calls are
+    /// synchronous appends and never fail the loop.
+    pub fn with_tracer<F>(self, f: F) -> Self
+    where
+        F: FnMut(crate::infra::trace::TraceEntry) + Send + 'static,
+    {
+        *self.tracer.borrow_mut() = Some(Box::new(f));
+        self
     }
 
     /// Swap the model provider at runtime (e.g. the desktop's provider
@@ -168,6 +207,10 @@ impl<'a> AgentRuntime<'a> {
     /// would race a running turn anyway. Between turns this is safe: the
     /// worker mailbox is drained sequentially on one thread.
     pub fn swap_model(&self, model: Box<dyn ModelProvider>) {
+        let mut model = model;
+        // The replacement must share the cancel flag too, or a Stop after
+        // a provider switch could no longer interrupt the model call.
+        model.set_cancel_flag(self.handle.flag());
         *self.model.borrow_mut() = model;
     }
 
@@ -206,6 +249,29 @@ impl<'a> AgentRuntime<'a> {
         self
     }
 
+    /// Source of mid-turn user messages, drained at each step boundary.
+    /// Returned messages are folded into the running turn (conversation +
+    /// scope) so the agent adapts on its next model call without stopping.
+    pub fn with_input_drain<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Vec<String> + Send + Sync + 'static,
+    {
+        self.input_drain = Some(Arc::new(f));
+        self
+    }
+
+    /// Source of a mid-turn provider switch. `f` returns `Some(model)` once
+    /// after the operator picks a new provider (and `None` otherwise); the
+    /// drive loop applies it before the next LLM request so the switch takes
+    /// effect on the very next step rather than after the turn ends.
+    pub fn with_model_reload<F>(mut self, f: F) -> Self
+    where
+        F: Fn() -> Option<Box<dyn ModelProvider>> + Send + Sync + 'static,
+    {
+        self.model_reload = Some(Arc::new(f));
+        self
+    }
+
     /// Inject a process executor (tests, dry runs). Production defaults to
     /// the local process executor — direct `Command::new(exe).args(argv)`,
     /// never a shell.
@@ -217,6 +283,9 @@ impl<'a> AgentRuntime<'a> {
     /// Inject an externally-created handle so callers can cancel before
     /// the runtime is even moved into its worker thread.
     pub fn with_handle(mut self, handle: RuntimeHandle) -> Self {
+        // Hand the model the same cancel flag so a Stop interrupts an
+        // in-flight CLI-harness model call, not just tool executions.
+        self.model.borrow_mut().set_cancel_flag(handle.flag());
         self.handle = handle;
         self
     }
@@ -264,6 +333,18 @@ impl<'a> AgentRuntime<'a> {
         target: Target,
         emit: &mut dyn FnMut(AgentEvent),
     ) -> InvestigationResult {
+        self.investigate_with_state(target, emit).0
+    }
+
+    /// Same as [`Self::investigate_with`] but also returns the authoritative
+    /// [`AssessmentState`] snapshot so UIs can render families, findings,
+    /// attack paths, identity/privilege, unknowns, and completion from
+    /// runtime state instead of hardcoded data.
+    pub fn investigate_with_state(
+        &self,
+        target: Target,
+        emit: &mut dyn FnMut(AgentEvent),
+    ) -> (InvestigationResult, AssessmentState) {
         use super::events::AgentEvent as Ev;
 
         emit(Ev::InvestigationStarted {
@@ -273,6 +354,27 @@ impl<'a> AgentRuntime<'a> {
         let mut sess = self.session();
         sess.policy = self.policy.for_target(&target.address);
         sess.scope_label = target.address.clone();
+        sess.assessment.id = assessment_id_for_target(
+            &target.address,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        sess.assessment.target_roots = vec![target.address.clone()];
+        // Autonomous mode for the brief; no staged note carries across
+        // investigations sharing a process.
+        sess.cm.set_autonomous(true);
+        sess.cm.clear_staged_model_note();
+        sess.trace(
+            crate::infra::trace::tag::ASSESSMENT_START,
+            format!("assessment {} on {}", sess.assessment.id, target.address),
+            serde_json::json!({
+                "assessment": sess.assessment.id,
+                "target": target.address,
+            }),
+        );
+        sess.persist_best_effort();
         let outcome = sess.drive(true, emit);
         let finish_reason = match outcome {
             DriveOutcome::Finished(r) => FinishReason::ModelFinished(r),
@@ -287,34 +389,72 @@ impl<'a> AgentRuntime<'a> {
             // continues. Mapped defensively regardless.
             DriveOutcome::Replied(r) => FinishReason::ModelFinished(r),
         };
+        let reason_text = match &finish_reason {
+            FinishReason::ModelFinished(r) => r.clone(),
+            FinishReason::MaxSteps(n) => format!("max steps ({n}) reached"),
+            FinishReason::Cancelled => "cancelled".to_string(),
+            FinishReason::TooManyModelErrors { count, last_error } => {
+                format!("model failed {count} times in a row: {last_error}")
+            }
+            FinishReason::ConfigError(e) => format!("misconfigured: {e}"),
+            FinishReason::ContextExhausted => {
+                "context window exhausted even after compaction — findings and vault preserved; start a new run to continue".to_string()
+            }
+        };
+        sess.trace(
+            crate::infra::trace::tag::ASSESSMENT_FINISH,
+            format!("assessment {} finished: {}", sess.assessment.id, reason_text.chars().take(120).collect::<String>()),
+            serde_json::json!({
+                "assessment": sess.assessment.id,
+                "steps_taken": sess.step,
+                "tool_results": sess.tool_results.len(),
+            }),
+        );
         emit(Ev::Finished {
-            reason: match &finish_reason {
-                FinishReason::ModelFinished(r) => r.clone(),
-                FinishReason::MaxSteps(n) => format!("max steps ({n}) reached"),
-                FinishReason::Cancelled => "cancelled".to_string(),
-                FinishReason::TooManyModelErrors { count, last_error } => {
-                    format!("model failed {count} times in a row: {last_error}")
-                }
-                FinishReason::ConfigError(e) => format!("misconfigured: {e}"),
-                FinishReason::ContextExhausted => {
-                    "context window exhausted even after compaction — findings and vault preserved; start a new run to continue".to_string()
-                }
-            },
+            reason: reason_text,
         });
-        sess.into_result(target, finish_reason)
+        let assessment = sess.assessment.clone();
+        (sess.into_result(target, finish_reason), assessment)
     }
 
     /// A fresh interactive session: persistent context and scope across
     /// turns. Scope starts EMPTY — nothing may execute until the user
     /// mentions a target (parsed by us, never the model).
+    ///
+    /// Every call shares the literal assessment id `"session"` — fine for
+    /// a single chat, but a caller that keeps several interactive
+    /// sessions alive (e.g. one per desktop chat tab) must use
+    /// [`Self::session_with_id`] instead, or every chat's
+    /// `persist_best_effort` snapshot overwrites the same file.
     pub fn session(&self) -> AgentSession<'_, 'a> {
+        self.session_with_id("session")
+    }
+
+    /// [`Self::session`] with an explicit, caller-chosen assessment id
+    /// (validated the same way [`super::assessment::save_in`] validates
+    /// one at persist time — an invalid id just means persistence will
+    /// fail safely later, never a panic here). Use this whenever more
+    /// than one interactive session may be live at once, so each gets
+    /// its own snapshot file instead of silently sharing `"session"`.
+    pub fn session_with_id(&self, id: &str) -> AgentSession<'_, 'a> {
+        let now = super::assessment::now_unix();
+        let mut assessment = AssessmentState::new(id, Vec::new(), now);
+        assessment.seed_from_families(&super::families::builtin_families(), None);
         AgentSession {
             rt: self,
             env: self.state.clone(),
             cm: ContextManager::new(),
+            assessment,
             tool_results: Vec::new(),
             consecutive_errors: 0,
+            consecutive_slow_errors: 0,
             step: 0,
+            finish_denies: 0,
+            repeat_fail_sig: String::new(),
+            repeat_fail_count: 0,
+            repeat_fail_state: 0,
+            repeat_fail_last: String::new(),
+            breaker_trips: 0,
             hypothesis_seq: 0,
             policy: self.policy.for_session(),
             scope_label: String::new(),
@@ -375,15 +515,242 @@ impl<'a> AgentRuntime<'a> {
                 }
             })
             .collect();
-        let (view, _report) = cm.build_view_with_schemas(
+        let (view, report) = cm.build_view_with_schemas(
             target,
             step,
             available,
             env.unavailable_capabilities().len(),
             capability_schemas,
         );
+        if let Some(tracer) = self.tracer.borrow_mut().as_mut() {
+            tracer(crate::infra::trace::TraceEntry::new(
+                step,
+                "",
+                crate::infra::trace::tag::CONTEXT_BUILT,
+                format!(
+                    "context built: {} chars (elided obs {}/{}, evidence {}, narr {}, actions {})",
+                    report.total_chars,
+                    report.elided_observations,
+                    view.observations.len(),
+                    report.elided_evidence,
+                    report.elided_narrations,
+                    report.elided_actions,
+                ),
+                serde_json::json!({
+                    "total_chars": report.total_chars,
+                    "elided_observations": report.elided_observations,
+                    "elided_evidence": report.elided_evidence,
+                    "elided_narrations": report.elided_narrations,
+                    "elided_actions": report.elided_actions,
+                    "observations_kept": view.observations.len(),
+                    "findings_kept": view.findings.len(),
+                }),
+            ));
+        }
         view
     }
+
+    /// Resume a previously persisted assessment into a live session.
+    /// Replays tracked findings into the ContextManager registry so the
+    /// model sees them immediately; observations/graph/evidence ride the
+    /// projection from the loaded state.
+    pub fn resume_session(&self, assessment: AssessmentState) -> AgentSession<'_, 'a> {
+        let mut sess = self.session();
+        for f in assessment.findings.findings.clone() {
+            sess.cm.replay_finding(Finding {
+                id: f.id,
+                severity: f.severity.clone(),
+                title: f.title.clone(),
+                target: f.target.clone(),
+                source: "replay".into(),
+                detail: f.note.clone(),
+                status: match f.stage {
+                    super::findings::FindingStage::Validated
+                    | super::findings::FindingStage::Exploited
+                    | super::findings::FindingStage::ImpactDemonstrated
+                    | super::findings::FindingStage::Chained => "confirmed".into(),
+                    super::findings::FindingStage::Closed => "false_positive".into(),
+                    _ => "open".into(),
+                },
+                step_found: 0,
+                step_updated: 0,
+            });
+        }
+        sess.step = assessment.last_completed_step;
+        restore_scope(&mut sess, &assessment.target_roots, &assessment.scope_label);
+        sess.assessment = assessment;
+        sess
+    }
+
+    /// [`Self::resume_session`] plus a previously persisted
+    /// [`ContextManager`] snapshot (see `context::save`/`context::load`).
+    /// This is the full resume path: `assessment` restores the
+    /// authoritative world model (attack graph, target model, family
+    /// progress, evidence log) AND the granted scope (otherwise
+    /// in-memory-only — see `persist_best_effort`), and `cm` restores
+    /// everything the session log's record-by-record replay could not
+    /// reconstruct — prior actions (with their reason and
+    /// effectiveness), raw tool evidence, and the error history —
+    /// instead of leaving them wiped on every reopen. `cm`'s own
+    /// findings/narrations/conversation supersede the ones
+    /// `resume_session` would have replayed from `assessment` alone, so
+    /// this skips that replay rather than doing it twice.
+    pub fn resume_session_with_context(
+        &self,
+        assessment: AssessmentState,
+        cm: ContextManager,
+    ) -> AgentSession<'_, 'a> {
+        let mut sess = self.session_with_id(&assessment.id);
+        sess.step = assessment.last_completed_step;
+        restore_scope(&mut sess, &assessment.target_roots, &assessment.scope_label);
+        sess.assessment = assessment;
+        sess.cm = cm;
+        sess
+    }
+}
+
+/// Re-grant every persisted scope root and restore the primary label.
+/// `ExecutionPolicy` is never itself serialized — this is the only way a
+/// resumed session regains the ability to act on anything, instead of
+/// every action rejecting with "outside assessment scope ('')" the way
+/// a brand new, never-granted session would.
+fn restore_scope(sess: &mut AgentSession<'_, '_>, target_roots: &[String], scope_label: &str) {
+    for root in target_roots {
+        sess.policy.grant_scope(root);
+    }
+    sess.scope_label = if !scope_label.is_empty() {
+        scope_label.to_string()
+    } else {
+        target_roots.first().cloned().unwrap_or_default()
+    };
+}
+
+/// Short decision classifier for traces (no payload).
+fn decision_kind(d: &super::model::Decision) -> &'static str {
+    use super::model::Decision::*;
+    match d {
+        Execute { .. } => "execute",
+        CreateHypothesis { .. } => "hypothesis",
+        Finish { .. } => "finish",
+        Reply { .. } => "reply",
+        Narrate { .. } => "narrate",
+        WebSearch { .. } => "web_search",
+        FileRead { .. } => "file_read",
+        FileWrite { .. } => "file_write",
+        ReportFinding { .. } => "report_finding",
+        UpdateFinding { .. } => "update_finding",
+        VaultStore { .. } => "vault_store",
+        VaultRecall { .. } => "vault_recall",
+    }
+}
+
+/// Redacted decision detail for traces: identifiers and lengths only.
+/// Free text (reason/statement/text/query) is length + scrubbed head:
+/// the model may echo tokens it just read.
+fn decision_trace_detail(d: &super::model::Decision) -> serde_json::Value {
+    use super::model::Decision::*;
+    let head = |s: &str| {
+        crate::infra::trace::scrub_text(&s.chars().take(300).collect::<String>(), 300)
+    };
+    match d {
+        Execute {
+            capability,
+            target,
+            options,
+            reason,
+        } => serde_json::json!({
+            "capability": capability,
+            "target": target,
+            "options": sanitized_options(options),
+            "reason_len": reason.chars().count(),
+        }),
+        CreateHypothesis {
+            statement,
+            confidence,
+        } => serde_json::json!({"statement_head": head(statement), "confidence": confidence}),
+        Finish { reason } => serde_json::json!({"reason_len": reason.chars().count()}),
+        Reply { text } | Narrate { text } => {
+            serde_json::json!({"text_len": text.chars().count(), "text_head": head(text)})
+        }
+        WebSearch { query, .. } => serde_json::json!({"query_len": query.chars().count()}),
+        FileRead { path, grep, lines, .. } => serde_json::json!({
+            "path": path, "grep": grep, "lines": lines,
+        }),
+        FileWrite { path, content, .. } => serde_json::json!({
+            "path": path, "content_len": content.chars().count(),
+        }),
+        ReportFinding {
+            severity,
+            title,
+            target,
+            detail,
+        } => serde_json::json!({
+            "severity": severity, "title": title, "target": target,
+            "detail_len": detail.chars().count(),
+        }),
+        UpdateFinding { id, status, .. } => serde_json::json!({"id": id, "status": status}),
+        VaultStore { key, kind, source, .. } => serde_json::json!({
+            "key": key, "kind": kind, "source": source,
+        }),
+        VaultRecall { query } => serde_json::json!({"query": query}),
+    }
+}
+
+/// Short drive-outcome classifier for traces.
+fn drive_outcome_kind(o: &DriveOutcome) -> &'static str {
+    match o {
+        DriveOutcome::Replied(_) => "replied",
+        DriveOutcome::Finished(_) => "finished",
+        DriveOutcome::MaxSteps(_) => "max_steps",
+        DriveOutcome::Cancelled => "cancelled",
+        DriveOutcome::TooManyModelErrors { .. } => "too_many_model_errors",
+        DriveOutcome::ConfigError(_) => "config_error",
+        DriveOutcome::ContextExhausted => "context_exhausted",
+    }
+}
+
+/// Redacted option summary for traces: option NAMES plus value kind and
+/// length — never values (they may carry tokens, passwords, bodies).
+fn sanitized_options(options: &super::model::OptionSet) -> serde_json::Value {    let map: serde_json::Map<String, serde_json::Value> = options
+        .iter()
+        .map(|(k, v)| {
+            let desc = match v {
+                super::model::OptionValue::Str(s) => {
+                    format!("str(len={})", s.chars().count())
+                }
+                super::model::OptionValue::Num(n) => format!("num({n})"),
+                super::model::OptionValue::Bool(b) => format!("bool({b})"),
+                // Header/option NAMES only — values may be tokens.
+                super::model::OptionValue::Map(m) => {
+                    format!("map{{{}}}", m.keys().cloned().collect::<Vec<_>>().join(","))
+                }
+            };
+            (k.clone(), serde_json::Value::String(desc))
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
+/// Filesystem-safe assessment id for a target (`a-<host>-<millis>`).
+pub fn assessment_id_for_target(target: &str, now_ms: i64) -> String {    let host = super::policy::host_of(target);
+    let mut clean: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    clean = clean.trim_matches('-').to_string();
+    if clean.is_empty() {
+        clean = "target".to_string();
+    }
+    if clean.len() > 40 {
+        clean.truncate(40);
+    }
+    format!("a-{clean}-{now_ms}")
 }
 
 /// Outcome of a blocking approval wait.
@@ -400,9 +767,10 @@ enum ApprovalDecision {
 /// Vault values are never in the materials, and the instruction forbids
 /// inventing findings beyond the registry (the registry itself is
 /// re-injected verbatim every turn, so the summary cannot corrupt it).
-const COMPACT_SYSTEM: &str = r#"You are compacting a security-assessment conversation that outgrew the model's context window. Write a dense structured summary of the MATERIALS below (which end with the oldest retained conversation turns).
+const COMPACT_FORK_INSTRUCTION: &str = r#"CONTEXT COMPACTION OVERRIDE: ignore the RESPONSE CONTRACT for this message only — output a prose summary below, not a JSON decision. The conversation above outgrew the context window.
 
-Sections (keep each tight, ~1500 words total):
+Write a dense structured summary (~1500 words):
+
 1. GOAL + TARGET — what is being assessed.
 2. WHAT WAS TRIED — tools/capabilities run and what each learned (1 line each).
 3. CURRENT UNDERSTANDING — hypotheses, validated paths, dead ends.
@@ -410,7 +778,7 @@ Sections (keep each tight, ~1500 words total):
 5. LAST ERROR — only if one is present.
 
 Rules:
-- Carry the FINDINGS REGISTRY over faithfully (ids, severities, statuses). NEVER invent findings beyond it.
+- The brief's FINDINGS REGISTRY is authoritative: carry every finding over faithfully (ids, severities, statuses). NEVER invent findings beyond it.
 - Carry VAULT KEY NAMES over (you do not have the values; never ask for them to be repeated here).
 - Preserve concrete facts (hosts, ports, paths, versions, exact error strings); drop chit-chat and intermediate reasoning.
 - Plain text, no JSON, no markdown headers beyond the numbered sections."#;
@@ -447,8 +815,17 @@ pub struct AgentSession<'r, 'a> {
     /// state without mutating the shared environment snapshot.
     env: EnvironmentState,
     cm: ContextManager,
+    /// Authoritative security state (TargetModel + graph + findings +
+    /// evidence + family progress + objectives). Persisted per assessment;
+    /// ContextManager only projects views from it.
+    assessment: AssessmentState,
     tool_results: Vec<ToolResult>,
     consecutive_errors: usize,
+    /// Consecutive SLOW-burn LLM failures (full-budget timeouts, stalls,
+    /// rate limits). Gives up after [`LLM_MAX_SLOW_RETRIES`] instead of
+    /// riding out all 5 tries — two burned budgets in a row means the
+    /// endpoint is wedged, not flapping. Reset on any success.
+    consecutive_slow_errors: usize,
     step: usize,
     /// Monotonic id for hypothesis events (event-only: the model's
     /// reasoning, not a store we rank).
@@ -476,6 +853,56 @@ pub struct AgentSession<'r, 'a> {
     /// the first vault decision (vaults are per-target; an unscoped
     /// session has nowhere to store).
     vault: Option<VaultManager>,
+    /// Consecutive completion denials. Caps gating loops: after
+    /// MAX_FINISH_DENIES the proposal is accepted so a stubborn model
+    /// cannot spin forever (termination safety; still surfaced via events).
+    finish_denies: usize,
+    /// Consecutive decision-level execution failures for one request
+    /// signature (repeat-failure circuit breaker). The signature covers
+    /// capability + target + normalized argument SHAPE (option names and
+    /// value lengths, never values), so a retry with changed arguments
+    /// is a different request and allowed — only byte-equivalent repeats
+    /// trip the breaker.
+    repeat_fail_sig: String,
+    repeat_fail_count: u32,
+    /// Assessment state version (observations + findings) at the last
+    /// failure. New evidence re-arms one retry of the same signature:
+    /// the world changed, so the outcome might too.
+    repeat_fail_state: usize,
+    /// First line of the most recent failure for this signature.
+    repeat_fail_last: String,
+    /// Breaker trips for the current signature. Caps the block loop:
+    /// a model that retries the identical failing request past the
+    /// remediation ends the turn instead of burning calls forever.
+    breaker_trips: u32,
+}
+
+/// Canonical signature of a request for repeat detection:
+/// `capability|target|opt1=kind[,opt2=...]` with options sorted by name
+/// and values reduced to kind+length (headers reduce to sorted names).
+/// Two decisions with equal signatures would send equivalent requests.
+fn request_signature(request: &CapabilityRequest) -> String {
+    let mut parts: Vec<String> = vec![request.capability.clone(), request.target.clone()];
+    let mut opts: Vec<String> = request
+        .options
+        .iter()
+        .map(|(k, v)| {
+            let shape = match v {
+                super::model::OptionValue::Str(s) => {
+                    format!("str:{}", s.chars().count())
+                }
+                super::model::OptionValue::Num(n) => format!("num:{n}"),
+                super::model::OptionValue::Bool(b) => format!("bool:{b}"),
+                super::model::OptionValue::Map(m) => {
+                    format!("map:{}", m.keys().cloned().collect::<Vec<_>>().join(","))
+                }
+            };
+            format!("{k}={shape}")
+        })
+        .collect();
+    opts.sort();
+    parts.extend(opts);
+    parts.join("|")
 }
 
 /// Decisions of progress required between two auto-compactions.
@@ -511,7 +938,19 @@ impl<'r, 'a> AgentSession<'r, 'a> {
         // fixing the visibility.
         self.grant_scope_from_message(user_message, emit);
         self.cm.begin_turn(user_message);
+        // Interactive mode for the brief; a fresh turn drops any staged
+        // model note left over from a previous turn.
+        self.cm.set_autonomous(false);
+        self.cm.clear_staged_model_note();
         let outcome = self.drive(false, emit);
+        self.trace(
+            crate::infra::trace::tag::TURN_END,
+            format!("turn ended: {}", drive_outcome_kind(&outcome)),
+            serde_json::json!({
+                "outcome": drive_outcome_kind(&outcome),
+                "step": self.step,
+            }),
+        );
         match &outcome {
             DriveOutcome::Replied(text) => {
                 let text = text.clone();
@@ -524,6 +963,7 @@ impl<'r, 'a> AgentSession<'r, 'a> {
             DriveOutcome::Finished(reason) => {
                 let reason = reason.clone();
                 self.cm.end_turn(&reason);
+                self.cm.push_assistant(reason.clone());
                 emit(Ev::Finished {
                     reason: reason.clone(),
                 });
@@ -534,22 +974,33 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     "I hit the per-turn step limit ({n}). Ask me to continue and I'll pick up where I left off."
                 );
                 self.cm.end_turn(&text);
+                self.cm.push_assistant(text.clone());
                 emit(Ev::Reply { text });
             }
-            DriveOutcome::TooManyModelErrors { last_error, .. } => {
+            DriveOutcome::TooManyModelErrors { count, last_error } => {
+                // Worded neutrally on purpose: the budget covers BOTH
+                // unreachable-model (transport) and reachable-but-
+                // unparseable-model (bad responses) failures — saying
+                // "couldn't reach" misdiagnoses the latter.
                 let text =
-                    format!("I couldn't reach the model repeatedly and stopped: {last_error}");
+                    format!("The model step failed {count} times in a row and I stopped: {last_error}");
                 self.cm.end_turn(&text);
+                self.cm.push_assistant(text.clone());
+                // A give-up ends the turn: no staged note may leak into
+                // the next turn's tail.
+                self.cm.clear_staged_model_note();
                 emit(Ev::Reply { text });
             }
             DriveOutcome::ConfigError(e) => {
                 let text = format!("Model configuration problem: {e}");
                 self.cm.end_turn(&text);
+                self.cm.push_assistant(text.clone());
                 emit(Ev::Reply { text });
             }
             DriveOutcome::ContextExhausted => {
                 let text = "My context filled up and even a compacted summary can't fit what remains — I've kept every finding and vault key, so nothing confirmed is lost. Start a new turn or session and I'll continue from the registry.".to_string();
                 self.cm.end_turn(&text);
+                self.cm.push_assistant(text.clone());
                 emit(Ev::Reply { text });
             }
             DriveOutcome::Cancelled => {}
@@ -564,7 +1015,15 @@ impl<'r, 'a> AgentSession<'r, 'a> {
         for host in hosts_in(message) {
             if self.policy.grant_scope(&host) {
                 self.scope_label = host.clone();
-                emit(AgentEvent::ScopeGranted { target: host });
+                emit(AgentEvent::ScopeGranted { target: host.clone() });
+                self.trace(
+                    crate::infra::trace::tag::SCOPE_GRANT,
+                    format!("scope granted: {host}"),
+                    serde_json::json!({
+                        "host": host,
+                        "scope_label": self.scope_label,
+                    }),
+                );
             }
         }
         // Late grants (message after the first) still update the label.
@@ -623,6 +1082,160 @@ impl<'r, 'a> AgentSession<'r, 'a> {
         self.cm.set_vault_keys(keys);
     }
 
+    /// Resolve `{{vault:key}}` references in tool options against the
+    /// session vault, out of band at execution time. Fast path: options
+    /// without references return cloned without touching the vault (an
+    /// unavailable vault is then not an error either).
+    fn resolve_vault_refs_in_options(
+        &mut self,
+        options: &super::model::OptionSet,
+    ) -> Result<super::model::OptionSet, String> {
+        if !super::model::options_contain_vault_refs(options) {
+            return Ok(options.clone());
+        }
+        match self.vault_mut() {
+            Ok(vault) => super::model::substitute_vault_refs(options, &|k| {
+                vault.recall(k).ok().map(|(_, val)| val.to_string())
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Text variant for direct tools (file content). Same contract.
+    fn resolve_vault_refs_in_text(&mut self, text: &str) -> Result<String, String> {
+        if !text.contains("{{vault:") {
+            return Ok(text.to_string());
+        }
+        match self.vault_mut() {
+            Ok(vault) => super::model::substitute_vault_refs_in_text(text, &|k| {
+                vault.recall(k).ok().map(|(_, val)| val.to_string())
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Bump family progress for fresh evidence (marks InProgress/Tested,
+    /// counts evidence, emits nothing — callers emit the progress event).
+    fn mark_family_evidence(&mut self, family: &str) {
+        let progress = if let Some(p) = self
+            .assessment
+            .family_progress
+            .iter_mut()
+            .find(|p| p.family == family)
+        {
+            p.evidence_count += 1;
+            p.tested_questions = (p.tested_questions + 1).min(p.total_questions.max(1));
+            p.status = super::completeness::AssessmentStatus::InProgress;
+            Some((
+                p.tested_questions,
+                p.total_questions,
+                p.evidence_count,
+                format!("{:?}", p.status),
+            ))
+        } else {
+            None
+        };
+        if let Some((tested, total, evidence, status)) = progress {
+            self.trace(
+                crate::infra::trace::tag::STATE_FAMILY,
+                format!("family {family} +evidence ({tested}/{total})"),
+                serde_json::json!({
+                    "family": family,
+                    "status": status,
+                    "evidence_count": evidence,
+                }),
+            );
+        }
+    }
+
+    /// Best-effort snapshot after each state mutation. Never fails the
+    /// loop: a full disk or poisoned path must not kill an assessment.
+    fn persist_best_effort(&mut self) {
+        self.assessment.touch(super::assessment::now_unix(), self.step);
+        // `scope_label` and the policy's granted roots are otherwise
+        // in-memory-only (ExecutionPolicy is never itself serialized):
+        // without syncing them here, a session resumed from this
+        // snapshot would regain the world model and findings but have
+        // NO scope at all, rejecting every subsequent action.
+        self.assessment.target_roots = self.policy.scope_roots();
+        self.assessment.scope_label = self.scope_label.clone();
+        let saved = super::assessment::save(&self.assessment);
+        // The ContextManager snapshot is the other half of a full resume
+        // (see `resume_session_with_context`): without it, a reopened
+        // session regains the world model but not prior_actions, raw
+        // evidence, or the error history — all pure ContextManager state
+        // the assessment snapshot never carried.
+        let cm_saved = super::context::save(&self.assessment.id, &self.cm);
+        self.trace(
+            crate::infra::trace::tag::STATE_SNAPSHOT,
+            format!(
+                "snapshot {} step {} {} (context {})",
+                self.assessment.id,
+                self.step,
+                if saved.is_ok() { "ok" } else { "FAILED" },
+                if cm_saved.is_ok() { "ok" } else { "FAILED" }
+            ),
+            serde_json::json!({
+                "assessment": self.assessment.id,
+                "ok": saved.is_ok(),
+                "context_ok": cm_saved.is_ok(),
+            }),
+        );
+    }
+
+    /// Append one debug-trace line (no-op when no tracer is attached).
+    /// Values are scrubbed inside [`TraceEntry::new`]; callers pass the
+    /// natural payload and must still avoid vault values / bodies.
+    fn trace(&self, tag: &str, msg: String, data: serde_json::Value) {
+        if let Some(tracer) = self.rt.tracer.borrow_mut().as_mut() {
+            tracer(crate::infra::trace::TraceEntry::new(
+                self.step,
+                &self.assessment.id,
+                tag,
+                msg,
+                data,
+            ));
+        }
+    }
+
+    /// Monotonic assessment-state version for the breaker: observations
+    /// + findings + evidence records. When it advances, the world changed
+    /// and one retry of a previously failed signature is allowed.
+    fn state_version(&self) -> usize {
+        self.cm.observations().len()
+            + self.cm.findings().len()
+            + self.assessment.evidence.records.len()
+    }
+
+    /// Record a decision-level execution outcome for the repeat-failure
+    /// breaker. Success (or a different signature) resets the streak.
+    /// `detail` is the failure's first line, kept for remediation text
+    /// (the ContextManager error is cleared before the next decision).
+    fn note_execution_outcome(
+        &mut self,
+        request: &CapabilityRequest,
+        success: bool,
+        detail: &str,
+    ) {
+        let sig = request_signature(request);
+        if success {
+            self.repeat_fail_sig.clear();
+            self.repeat_fail_count = 0;
+            self.breaker_trips = 0;
+            self.repeat_fail_last.clear();
+        } else if self.repeat_fail_sig == sig {
+            self.repeat_fail_count = self.repeat_fail_count.saturating_add(1);
+            self.repeat_fail_last = detail.chars().take(200).collect();
+            self.repeat_fail_state = self.state_version();
+        } else {
+            self.repeat_fail_sig = sig;
+            self.repeat_fail_count = 1;
+            self.breaker_trips = 0;
+            self.repeat_fail_last = detail.chars().take(200).collect();
+            self.repeat_fail_state = self.state_version();
+        }
+    }
+
     /// Char/4 estimate of the live window: conversation + observations +
     /// findings + vault keys + narrations. Used after a compaction (the
     /// provider's next `usage` block takes over from there).
@@ -643,74 +1256,43 @@ impl<'r, 'a> AgentSession<'r, 'a> {
         ((conv + obs + fnd) / 4) as u64 + 512
     }
 
-    /// Bounded materials for the summarizer call: the summarization
-    /// request itself must fit the window, so history is capped (newest
-    /// observations/actions, truncated conversation text). Findings and
-    /// vault KEY NAMES ride in full — the summary must never lose them,
-    /// and vault VALUES are never present to leak.
-    fn compaction_materials(&self) -> String {
-        const MAX_CONV_CHARS: usize = 60_000;
-        let mut out = String::new();
-        out.push_str(&format!(
-            "Assessment target: {}\nSteps so far: {}\n\n",
-            self.scope_label, self.step
-        ));
-        out.push_str("FINDINGS REGISTRY (complete — carry these over by id, severity, status; do not re-derive or invent):\n");
-        if self.cm.findings().is_empty() {
-            out.push_str("(none yet)\n");
-        }
-        for f in self.cm.findings() {
-            out.push_str(&format!(
-                "F{} [{}|{}] {} ({}) — {}\n",
-                f.id, f.severity, f.status, f.title, f.target, f.detail
-            ));
-        }
-        out.push_str("\nVAULT KEYS (names only — carry the names over so they stay known):\n");
-        let keys = self.vault_key_lines();
-        if keys.is_empty() {
-            out.push_str("(vault empty)\n");
-        }
-        for k in &keys {
-            out.push_str(&format!("{k}\n"));
-        }
-        out.push_str("\nRECENT OBSERVATIONS (newest last):\n");
-        let obs = self.cm.observations();
-        for o in obs.iter().rev().take(30).collect::<Vec<_>>().into_iter().rev() {
-            out.push_str(&format!("O{}: {}\n", o.id, o.summary));
-        }
-        out.push_str("\nCONVERSATION (oldest first, truncated to fit):\n");
-        let mut budget = MAX_CONV_CHARS;
-        let turns = self.cm.conversation();
-        let start = turns.len().saturating_sub(40);
-        for t in &turns[start..] {
-            for (role, text) in [("user", &t.user), ("assistant", &t.assistant)] {
-                if budget == 0 {
-                    break;
-                }
-                let take = text.len().min(budget);
-                let mut cut = take;
-                while cut > 0 && !text.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                out.push_str(&format!("{role}: {}\n", &text[..cut]));
-                budget -= cut;
-            }
-        }
-        if start > 0 || budget == 0 {
-            out.push_str("[older turns omitted for size]\n");
-        }
-        out
-    }
-
     /// Replace older turns with a model-written summary (or oldest-first
     /// truncation when the summarizer call fails). Findings, vault keys,
     /// narrations, and recent turns survive verbatim.
+    ///
+    /// The summarizer runs as a cache-reading FORK: the parent's exact
+    /// message array (system + brief + transcript + tail) with the
+    /// compaction instruction appended. From the gateway's perspective
+    /// this is nearly identical to the last request, so the cached
+    /// prefix is reused at read price instead of a full re-prefill.
+    /// Same SYSTEM_PROMPT throughout — a different system prompt would
+    /// invalidate the whole prefix.
     fn run_compaction(&mut self, emit: &mut dyn FnMut(AgentEvent)) {
         use super::events::AgentEvent as Ev;
         let before = self.used_tokens;
         let keep = self.rt.compact_keep_turns;
-        let materials = self.compaction_materials();
-        match self.rt.model.borrow().chat(COMPACT_SYSTEM, &materials) {
+        let target = Target::new(&self.scope_label);
+        let view = self
+            .rt
+            .context_view(&self.env, &target, self.step, &self.cm);
+        let mut messages =
+            super::model::render_chat_messages(&view.brief, &view.transcript, &view.tail);
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": COMPACT_FORK_INSTRUCTION,
+        }));
+        self.trace(
+            crate::infra::trace::tag::LLM_CHAT,
+            format!(
+                "compaction fork: {} parent messages + instruction",
+                messages.len().saturating_sub(1)
+            ),
+            serde_json::json!({"purpose": "compact", "messages": messages.len()}),
+        );
+        match self.rt.model.borrow().chat_messages(
+            super::model::SYSTEM_PROMPT,
+            &messages,
+        ) {
             Ok(summary) => {
                 self.cm.compact(&summary, keep);
                 self.refresh_vault_keys();
@@ -722,6 +1304,16 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     freed_tokens: before.saturating_sub(after),
                     fallback: false,
                 });
+                self.trace(
+                    crate::infra::trace::tag::CONTEXT_COMPACTED,
+                    format!("compacted {before} -> {after} tokens"),
+                    serde_json::json!({
+                        "before_tokens": before,
+                        "after_tokens": after,
+                        "summary_chars": summary.len(),
+                        "fallback": false,
+                    }),
+                );
             }
             Err(e) => {
                 // The summarizer failed (transport, bad response): degrade
@@ -742,6 +1334,15 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     freed_tokens: before.saturating_sub(after),
                     fallback: true,
                 });
+                self.trace(
+                    crate::infra::trace::tag::CONTEXT_COMPACTED,
+                    format!("compaction fallback {before} -> {after} tokens"),
+                    serde_json::json!({
+                        "before_tokens": before,
+                        "after_tokens": after,
+                        "fallback": true,
+                    }),
+                );
             }
         }
     }
@@ -751,6 +1352,27 @@ impl<'r, 'a> AgentSession<'r, 'a> {
     pub fn compact_now(&mut self, emit: &mut dyn FnMut(AgentEvent)) {
         self.run_compaction(emit);
         self.steps_since_compact = 0;
+    }
+
+    /// Re-grant scope from the session log's `Rec::Target` entries only —
+    /// safe to call after a snapshot-based resume (unlike full
+    /// [`Self::rehydrate`], which would duplicate the conversation and
+    /// narrations the snapshot already carries). A defensive backstop
+    /// for a snapshot saved before `persist_best_effort` started syncing
+    /// `scope_label`/`target_roots` onto `AssessmentState`: if the
+    /// resumed session still has no scope, this recovers it from the
+    /// log instead of leaving the session permanently unable to act.
+    pub fn restore_scope_from_log(&mut self, records: &[crate::infra::sessions::TimedRecord]) {
+        if !self.scope_label.is_empty() {
+            return;
+        }
+        use crate::infra::sessions::SessionRecord as Rec;
+        for timed in records {
+            if let Rec::Target { target } = &timed.record {
+                self.policy.grant_scope(target);
+                self.scope_label = target.clone();
+            }
+        }
     }
 
     /// Rebuild live model state (scope, conversation, observations) from a
@@ -817,6 +1439,30 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                             step_updated: *step,
                         });
                     }
+                    // Mirror into authoritative store (idempotent by
+                    // title+target); status maps onto the lifecycle.
+                    let family = super::families::infer_family(title, detail).to_string();
+                    let tracked = match self
+                        .assessment
+                        .findings
+                        .findings
+                        .iter()
+                        .find(|f| f.title == *title && f.target == *target)
+                        .map(|f| f.id)
+                    {
+                        Some(existing) => existing,
+                        None => self.assessment.findings.create(title, target, &family, severity),
+                    };
+                    let norm = status.trim().to_lowercase();
+                    if norm == "confirmed" {
+                        self.assessment
+                            .findings
+                            .promote_toward_validated(tracked, "replayed confirmed");
+                    } else if norm == "false_positive" || norm == "false-positive" {
+                        if let Some(f) = self.assessment.findings.get_mut(tracked) {
+                            let _ = f.transition(super::findings::FindingStage::Closed, "replayed");
+                        }
+                    }
                 }
                 Rec::CtxUsage { used, .. } => {
                     // Resume the meter where the session left off so a
@@ -874,7 +1520,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     output: msg.clone(),
                     tool_secs: 0.0,
                 });
-                self.cm.set_last_error(Some(msg));
+                self.cm.set_last_error(Some(msg.clone()));
+                self.trace(
+                    crate::infra::trace::tag::DECISION_FILE_READ,
+                    format!("file read rejected: {path}"),
+                    serde_json::json!({"path": path, "ok": false, "reason": msg}),
+                );
             }
             Ok(real) => {
                 // Wall-clock for the operation (read/grep slice) so the
@@ -945,7 +1596,18 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                             )
                         };
                         self.cm.add_observation(&path, &summary, "file.read", step);
-                        emit(Ev::ObservationAdded { summary });
+                        emit(Ev::ObservationAdded { summary: summary.clone() });
+                        self.trace(
+                            crate::infra::trace::tag::DECISION_FILE_READ,
+                            format!("file read ok: {path} ({returned}/{total} lines)"),
+                            serde_json::json!({
+                                "path": path,
+                                "mode": mode,
+                                "total_lines": total,
+                                "returned_lines": returned,
+                                "elided_lines": elided,
+                            }),
+                        );
                     }
                     Err(e) => {
                         let msg = format!("file read failed: {e}");
@@ -959,7 +1621,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                             output: msg.clone(),
                             tool_secs: t0.elapsed().as_secs_f64(),
                         });
-                        self.cm.set_last_error(Some(msg));
+                        self.cm.set_last_error(Some(msg.clone()));
+                        self.trace(
+                            crate::infra::trace::tag::DECISION_FILE_READ,
+                            format!("file read failed: {path}"),
+                            serde_json::json!({"path": path, "ok": false, "reason": msg}),
+                        );
                     }
                 }
             }
@@ -999,7 +1666,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     output: msg.clone(),
                     tool_secs: 0.0,
                 });
-                self.cm.set_last_error(Some(msg));
+                self.cm.set_last_error(Some(msg.clone()));
+                self.trace(
+                    crate::infra::trace::tag::DECISION_FILE_WRITE,
+                    format!("file write rejected: {path}"),
+                    serde_json::json!({"path": path, "ok": false, "reason": msg}),
+                );
             }
             Ok(real) => {
                 let t0 = std::time::Instant::now();
@@ -1027,7 +1699,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     let summary =
                         format!("wrote {} ({} bytes)", real.display(), bytes);
                     self.cm.add_observation(&path, &summary, "file.write", step);
-                    emit(Ev::ObservationAdded { summary });
+                    emit(Ev::ObservationAdded { summary: summary.clone() });
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_FILE_WRITE,
+                        format!("file write ok: {path} ({bytes} bytes)"),
+                        serde_json::json!({"path": path, "bytes": bytes}),
+                    );
                 }
                 Err(e) => {
                     let msg = format!("file write failed: {e}");
@@ -1041,7 +1718,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                         output: msg.clone(),
                         tool_secs: t0.elapsed().as_secs_f64(),
                     });
-                    self.cm.set_last_error(Some(msg));
+                    self.cm.set_last_error(Some(msg.clone()));
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_FILE_WRITE,
+                        format!("file write failed: {path}"),
+                        serde_json::json!({"path": path, "ok": false, "reason": msg}),
+                    );
                 }
                 }
             }
@@ -1084,15 +1766,59 @@ impl<'r, 'a> AgentSession<'r, 'a> {
     fn drive(&mut self, autonomous: bool, emit: &mut dyn FnMut(AgentEvent)) -> DriveOutcome {
         use super::events::AgentEvent as Ev;
 
-        let executor: Arc<dyn ProcessExecutor> = self
-            .rt
-            .executor
-            .clone()
-            .unwrap_or_else(|| Arc::new(LocalProcessExecutor::new()));
+        // Production default shares the cancel flag so a Stop kills the
+        // in-flight child within one poll tick instead of blocking the
+        // whole turn on a slow/hung subprocess. An injected executor
+        // (tests) is used as-is.
+        let executor: Arc<dyn ProcessExecutor> = self.rt.executor.clone().unwrap_or_else(|| {
+            Arc::new(LocalProcessExecutor::new().with_cancel(self.rt.handle.flag()))
+        });
         let turn_start_step = self.step;
         loop {
             if self.rt.handle.is_cancelled() {
+                self.trace(
+                    crate::infra::trace::tag::SESSION_CANCELLED,
+                    format!("turn cancelled at step {}", self.step),
+                    serde_json::json!({"step": self.step}),
+                );
                 return DriveOutcome::Cancelled;
+            }
+            // Fold in any user messages that arrived mid-turn. They join
+            // the SAME turn: appended to the conversation and run through
+            // scope-granting, so the model sees them when it builds the
+            // very next view and adapts — no stop, no fresh turn. Drained
+            // at the top of the loop so an injected message is visible on
+            // this iteration's decision, not one step later.
+            if let Some(drain) = &self.rt.input_drain {
+                for msg in drain() {
+                    self.grant_scope_from_message(&msg, emit);
+                    self.cm.inject_user_message(&msg);
+                    self.trace(
+                        crate::infra::trace::tag::SESSION_INPUT_INJECTED,
+                        format!("mid-turn user message folded in at step {}", self.step),
+                        serde_json::json!({"step": self.step, "message_len": msg.chars().count()}),
+                    );
+                    emit(Ev::UserMessageSeen { text: msg });
+                }
+            }
+            // Apply a pending provider switch before the next LLM request,
+            // so switching models mid-turn takes effect on the very next
+            // step (Claude Code / Codex behavior) instead of waiting for the
+            // turn to end. The new model inherits the cancel flag via
+            // `swap_model`, and keeps the session's context/scope untouched.
+            if let Some(reload) = &self.rt.model_reload {
+                if let Some(model) = reload() {
+                    let name = model.name().to_string();
+                    self.rt.swap_model(model);
+                    self.trace(
+                        crate::infra::trace::tag::SESSION_MODEL_SWAPPED,
+                        format!("model switched to {name} at step {}", self.step),
+                        serde_json::json!({"step": self.step, "model": name}),
+                    );
+                    emit(Ev::Status {
+                        message: format!("Switched model to {name}."),
+                    });
+                }
             }
             // Optional decision budget (None = unlimited): interactive
             // turns get a per-turn budget; autonomous runs a total budget.
@@ -1137,8 +1863,93 @@ impl<'r, 'a> AgentSession<'r, 'a> {
             let mut ctx = self
                 .rt
                 .context_view(&self.env, &target, self.step, &self.cm);
+            // Project authoritative state (attack graph, families, unknowns)
+            // into the LLM view. ContextManager stays a pure selector.
+            {
+                let (attack, families, unknowns, completion) =
+                    self.assessment.project_context();
+                ctx.attack_summary = attack.clone();
+                ctx.family_progress = families.clone();
+                ctx.unknowns = unknowns.clone();
+                ctx.completion_note = completion.clone();
+                // Volatile state projections ride the per-step tail (never
+                // the cached prefix): recomputed live every step.
+                if !attack.is_empty()
+                    || !families.is_empty()
+                    || !unknowns.is_empty()
+                    || completion.is_some()
+                {
+                    ctx.tail.push_str("STATE PROJECTION (authoritative — trust over older transcript content):\n");
+                    for line in &attack {
+                        ctx.tail.push_str(&format!("attack: {line}\n"));
+                    }
+                    for line in &families {
+                        ctx.tail.push_str(&format!("family: {line}\n"));
+                    }
+                    for line in &unknowns {
+                        ctx.tail.push_str(&format!("unknown: {line}\n"));
+                    }
+                    if let Some(note) = completion {
+                        ctx.tail.push_str(&format!("completion: {note}\n"));
+                    }
+                }
+            }
             ctx.autonomous = autonomous;
             ctx.vault_keys = self.vault_key_lines();
+            // Advisory planner ranking (logged, never executed by the
+            // harness): what the deterministic side considers highest
+            // value next to. The LLM still decides.
+            {
+                let candidates = super::planner::suggest(
+                    &self.assessment.investigation,
+                    &ctx.available_capabilities,
+                    5,
+                );
+                self.trace(
+                    crate::infra::trace::tag::PLANNER_SUGGEST,
+                    format!("planner: {} candidates", candidates.len()),
+                    serde_json::json!({
+                        "candidates": candidates.iter().map(|c| serde_json::json!({
+                            "objective_id": c.objective_id,
+                            "family": c.family,
+                            "capability": c.capability,
+                            "priority": c.priority,
+                        })).collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            // Trace the exact model input shape (sizes + redacted shape).
+            // The full prompt body is NOT stored: vault values ride the
+            // view for exactly one decision and must never land on disk.
+            self.trace(
+                crate::infra::trace::tag::LLM_REQUEST,
+                format!(
+                    "llm request step {} ({} caps, {} obs)",
+                    self.step,
+                    ctx.available_capabilities.len(),
+                    ctx.observations.len()
+                ),
+                serde_json::json!({
+                    "provider": self.rt.model.borrow().name(),
+                    "target": ctx.target,
+                    "step": ctx.step,
+                    "autonomous": ctx.autonomous,
+                    "available_capabilities": ctx.available_capabilities,
+                    "unavailable_count": ctx.unavailable_count,
+                    "observations_n": ctx.observations.len(),
+                    "narrations_n": ctx.narrations.len(),
+                    "recent_evidence_n": ctx.recent_evidence.len(),
+                    "prior_actions_n": ctx.prior_actions.len(),
+                    "capability_schemas_n": ctx.capability_schemas.len(),
+                    "findings_n": ctx.findings.len(),
+                    "vault_keys": ctx.vault_keys,
+                    "vault_values_n": ctx.vault_values.len(),
+                    "attack_summary": ctx.attack_summary,
+                    "family_progress": ctx.family_progress,
+                    "unknowns": ctx.unknowns,
+                    "has_last_error": ctx.last_error.is_some(),
+                }),
+            );
             let decision = {
                 // LLM latency attribution: every model call (failed or
                 // not) accumulates into the step's model_secs.
@@ -1154,22 +1965,106 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     limit_tokens: self.rt.context_tokens,
                     pct: self.usage_pct(),
                     estimated: usage.estimated,
+                    cached_tokens: usage.cached_tokens,
                 });
                 match outcome {
                     Ok(d) => {
                         self.consecutive_errors = 0;
+                        self.consecutive_slow_errors = 0;
                         self.cm.set_last_error(None);
+                        // Assistant replay: every decision lands in the
+                        // transcript verbatim, so the next step continues
+                        // from its own prior outputs. Reply/Narrate travel
+                        // as their natural text via add_narration later —
+                        // pushing them here too would duplicate them.
+                        if !matches!(
+                            d,
+                            Decision::Reply { .. } | Decision::Narrate { .. }
+                        ) {
+                            self.cm.push_assistant(
+                                super::model::render_decision_for_transcript(&d),
+                            );
+                        }
+                        let latency = model_t0.elapsed().as_secs_f64();
+                        self.trace(
+                            crate::infra::trace::tag::LLM_RESPONSE,
+                            format!(
+                                "llm response step {} in {:.1}s: {} (tokens {}/{})",
+                                self.step,
+                                latency,
+                                decision_kind(&d),
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                            ),
+                            serde_json::json!({
+                                "latency_secs": latency,
+                                "decision": decision_kind(&d),
+                                "detail": decision_trace_detail(&d),
+                                "usage": {
+                                    "prompt_tokens": usage.prompt_tokens,
+                                    "completion_tokens": usage.completion_tokens,
+                                    "total_tokens": usage.total_tokens,
+                                    "estimated": usage.estimated,
+                                    // Key deliberately free of the trace
+                                    // scrubber's sensitive fragments (which
+                                    // is why it is NOT `cached_tokens`):
+                                    // prefix-cache hits per call, the audit
+                                    // signal for the cache-first context
+                                    // architecture.
+                                    "cached": usage.cached_tokens,
+                                },
+                            }),
+                        );
                         d
+                    }
+                    Err(ModelError::Cancelled) => {
+                        // Stop pressed mid-call: not a failure — no error
+                        // count, no retry, no user-facing error card. The
+                        // turn ends cancelled; the session survives.
+                        self.trace(
+                            crate::infra::trace::tag::TURN_END,
+                            "model call cancelled mid-stream".to_string(),
+                            serde_json::json!({
+                                "latency_secs": model_t0.elapsed().as_secs_f64(),
+                            }),
+                        );
+                        return DriveOutcome::Cancelled;
                     }
                     Err(ModelError::Transport(e)) | Err(ModelError::BadResponse(e)) => {
                         self.consecutive_errors += 1;
-                        if self.consecutive_errors >= self.rt.max_consecutive_errors {
+                        let latency = model_t0.elapsed().as_secs_f64();
+                        let slow = super::model::is_slow_llm_error(&e);
+                        if slow {
+                            self.consecutive_slow_errors += 1;
+                        }
+                        // Slow burns give up early: consecutive full-budget
+                        // timeouts/stalls/rate-limits mean the endpoint is
+                        // wedged, not flapping — no point riding out all 5
+                        // tries at minutes apiece.
+                        let slow_give_up = slow
+                            && self.consecutive_slow_errors
+                                >= super::model::LLM_MAX_SLOW_RETRIES;
+                        if self.consecutive_errors >= self.rt.max_consecutive_errors
+                            || slow_give_up
+                        {
                             emit(Ev::Error {
                                 message: format!(
                                     "model failed {} times in a row: {e}",
                                     self.consecutive_errors
                                 ),
                             });
+                            self.trace(
+                                crate::infra::trace::tag::LLM_GAVE_UP,
+                                format!(
+                                    "llm gave up after {} errors",
+                                    self.consecutive_errors
+                                ),
+                                serde_json::json!({
+                                    "count": self.consecutive_errors,
+                                    "latency_secs": latency,
+                                }),
+                            );
+                            self.cm.clear_staged_model_note();
                             return DriveOutcome::TooManyModelErrors {
                                 count: self.consecutive_errors,
                                 last_error: e,
@@ -1185,10 +2080,36 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                 self.consecutive_errors, self.rt.max_consecutive_errors
                             ),
                         });
-                        // Backoff before the same-step retry so we don't hammer
-                        // the endpoint (exponential; cancellation-aware).
-                        let backoff_ms = 500u64 * (1u64 << (self.consecutive_errors - 1));
-                        for _ in 0..(backoff_ms / 50) {
+                        self.trace(
+                            crate::infra::trace::tag::LLM_RETRY,
+                            format!(
+                                "llm retry {}/{} after {:.1}s: {brief}",
+                                self.consecutive_errors,
+                                self.rt.max_consecutive_errors,
+                                latency
+                            ),
+                            serde_json::json!({
+                                "attempt": self.consecutive_errors,
+                                "latency_secs": latency,
+                            }),
+                        );
+                        // Pacing: a provider-honored Retry-After wins
+                        // (capped — a hostile header must not stall a step
+                        // for hours); else fast errors retry in 100ms and
+                        // slow burns back off exponentially. Cancellation-
+                        // aware in 50ms slices.
+                        let backoff_ms = match super::model::parse_retry_after_secs(&e) {
+                            Some(n) => {
+                                n.min(super::model::LLM_MAX_RETRY_AFTER_SECS)
+                                    .saturating_mul(1000)
+                                    .max(100)
+                            }
+                            None => super::model::llm_retry_delay_ms(
+                                self.consecutive_errors,
+                                &e,
+                            ),
+                        };
+                        for _ in 0..(backoff_ms / 50).max(1) {
                             if self.rt.handle.is_cancelled() {
                                 break;
                             }
@@ -1197,15 +2118,29 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                         if self.rt.handle.is_cancelled() {
                             return DriveOutcome::Cancelled;
                         }
-                        self.cm.set_last_error(Some(format!(
-                            "{e} (retry {}/{}) after {backoff_ms}ms)",
-                            self.consecutive_errors, self.rt.max_consecutive_errors
-                        )));
-                        continue; // same step retried with error surfaced to the model
+                        // Byte-identical retry: the view is deliberately NOT
+                        // amended (no last_error injection), so the retried
+                        // request shares the failed one's prefix — and on a
+                        // prefix-caching gateway it reuses the already-paid
+                        // prefill instead of paying it twice. The failure is
+                        // staged for the NEXT step's tail instead.
+                        self.cm.stage_model_note(
+                            format!(
+                                "model call failed ({brief}) — retried {}/{} with the identical request",
+                                self.consecutive_errors, self.rt.max_consecutive_errors
+                            ),
+                            self.step,
+                        );
+                        continue; // same step retried
                     }
                     Err(ModelError::MissingConfig(e)) => {
                         // Config errors never heal by retrying.
                         emit(Ev::Error { message: e.clone() });
+                        self.trace(
+                            crate::infra::trace::tag::LLM_MISCONFIGURED,
+                            "llm misconfigured".to_string(),
+                            serde_json::json!({}),
+                        );
                         return DriveOutcome::ConfigError(e);
                     }
                 }
@@ -1221,12 +2156,112 @@ impl<'r, 'a> AgentSession<'r, 'a> {
 
             match decision {
                 Decision::Finish { reason } => {
-                    return DriveOutcome::Finished(reason);
+                    // Completeness gate: the LLM proposes, Cipher disposes.
+                    // Backward-compatible: sessions with no seeded objectives
+                    // (legacy tests) finish immediately, as do runs that have
+                    // produced no evidence yet (nothing to gate on).
+                    const MAX_FINISH_DENIES: usize = 5;
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_FINISH_PROPOSED,
+                        format!("finish proposed: {}", reason.chars().take(120).collect::<String>()),
+                        serde_json::json!({"reason_len": reason.chars().count()}),
+                    );
+                    if self.assessment.investigation.objectives.is_empty()
+                        && self.assessment.family_progress.is_empty()
+                    {
+                        return DriveOutcome::Finished(reason);
+                    }
+                    // Nothing normalized into authoritative state yet (failed
+                    // runs, unparsed output): nothing to gate on. The raw
+                    // evidence log always grows, so gate on the normalized
+                    // graph instead. This keeps legacy loop tests green
+                    // while real runs with parsed observations hit the gate.
+                    if self.assessment.attack_graph.nodes.is_empty() {
+                        return DriveOutcome::Finished(reason);
+                    }
+                    if self.finish_denies >= MAX_FINISH_DENIES {
+                        emit(Ev::CompletionEvaluated {
+                            allowed: true,
+                            reason: "finish-denial budget exhausted; accepting to terminate".into(),
+                            remaining: 0,
+                        });
+                        self.trace(
+                            crate::infra::trace::tag::COMPLETION_VERDICT,
+                            "completion allowed: denial budget exhausted".to_string(),
+                            serde_json::json!({"allowed": true, "remaining": 0}),
+                        );
+                        return DriveOutcome::Finished(reason);
+                    }
+                    let available: Vec<String> = self
+                        .env
+                        .available_capabilities()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let verdict = super::completeness::evaluate(
+                        &self.assessment.family_progress,
+                        &self.assessment.investigation,
+                        &available,
+                        70,
+                    );
+                    emit(Ev::CompletionEvaluated {
+                        allowed: verdict.allowed,
+                        reason: verdict.reason.clone(),
+                        remaining: verdict.remaining.len(),
+                    });
+                    self.trace(
+                        crate::infra::trace::tag::COMPLETION_VERDICT,
+                        format!(
+                            "completion {}: {} ({} remaining)",
+                            if verdict.allowed { "allowed" } else { "rejected" },
+                            verdict.reason,
+                            verdict.remaining.len()
+                        ),
+                        serde_json::json!({
+                            "allowed": verdict.allowed,
+                            "reason": verdict.reason,
+                            "remaining": verdict.remaining.iter().take(5).map(|r| serde_json::json!({
+                                "family": r.family, "question": r.question,
+                                "resolving_capability": r.resolving_capability,
+                            })).collect::<Vec<_>>(),
+                            "finish_denies": self.finish_denies,
+                        }),
+                    );
+                    if verdict.allowed {
+                        return DriveOutcome::Finished(reason);
+                    }
+                    let lines: Vec<String> = verdict
+                        .remaining
+                        .iter()
+                        .take(5)
+                        .map(|r| {
+                            format!(
+                                "[{}] {} (via {})",
+                                r.family,
+                                r.question,
+                                r.resolving_capability.as_deref().unwrap_or("reasoning")
+                            )
+                        })
+                        .collect();
+                    self.cm.set_last_error(Some(format!(
+                        "completion rejected ({}): high-value unresolved questions remain: {} — investigate the highest-value one next",
+                        verdict.reason,
+                        lines.join(" | ")
+                    )));
+                    self.finish_denies += 1;
+                    self.step += 1;
+                    self.persist_best_effort();
+                    continue;
                 }
                 Decision::Reply { text } => {
                     // Autonomous runs have no user to answer: treat the
                     // reply as narration, count it as a step (so a
                     // reply-loop cannot spin forever) and keep driving.
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_REPLY,
+                        format!("reply ({} chars)", text.chars().count()),
+                        serde_json::json!({"text_len": text.chars().count()}),
+                    );
                     if autonomous {
                         self.step += 1;
                         continue;
@@ -1241,7 +2276,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     // cannot tell what the user already knows and
                     // re-announces the same finding after every tool.
                     self.cm.add_narration(&text);
-                    emit(Ev::Narrated { text });
+                    emit(Ev::Narrated { text: text.clone() });
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_NARRATE,
+                        format!("narrate ({} chars)", text.chars().count()),
+                        serde_json::json!({"text_len": text.chars().count()}),
+                    );
                     self.step += 1;
                 }
                 Decision::WebSearch { query, reason } => {
@@ -1307,6 +2347,15 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                     emit(Ev::ObservationAdded { summary });
                                 }
                             }
+                            self.trace(
+                                crate::infra::trace::tag::DECISION_WEB_SEARCH,
+                                format!("web search ok: {query} ({} hits)", results.len()),
+                                serde_json::json!({
+                                    "query_len": query.chars().count(),
+                                    "result_count": results.len(),
+                                    "tool_secs": t0.elapsed().as_secs_f64(),
+                                }),
+                            );
                         }
                         Err(e) => {
                             let msg = format!("web search failed: {e}");
@@ -1320,7 +2369,12 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                 output: msg.clone(),
                                 tool_secs: t0.elapsed().as_secs_f64(),
                             });
-                            self.cm.set_last_error(Some(msg));
+                            self.cm.set_last_error(Some(msg.clone()));
+                            self.trace(
+                                crate::infra::trace::tag::DECISION_WEB_SEARCH,
+                                format!("web search failed: {query}"),
+                                serde_json::json!({"query_len": query.chars().count(), "ok": false}),
+                            );
                         }
                     }
                     self.step += 1;
@@ -1333,11 +2387,36 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     // (and persisted as a Think record). The model owns
                     // its reasoning; we do not rank or link it.
                     self.hypothesis_seq += 1;
+                    // Also track it as a Hypothesis-stage finding so it
+                    // survives restarts and can later be promoted with
+                    // evidence (generic family inference, no app logic).
+                    let family = super::families::infer_family(&statement, "").to_string();
+                    let tracked = self.assessment.findings.create(
+                        &statement,
+                        &self.scope_label,
+                        &family,
+                        "Info",
+                    );
                     emit(Ev::HypothesisAdded {
                         id: self.hypothesis_seq,
-                        statement,
-                        confidence,
+                        statement: statement.clone(),
+                        confidence: confidence.clone(),
                     });
+                    emit(Ev::HypothesisCreated {
+                        statement: format!("tracked finding {tracked}"),
+                        family: family.clone(),
+                    });
+                    self.trace(
+                        crate::infra::trace::tag::HYPOTHESIS_CREATED,
+                        format!("hypothesis H{} [{confidence}]", self.hypothesis_seq),
+                        serde_json::json!({
+                            "id": self.hypothesis_seq,
+                            "confidence": confidence,
+                            "family": family,
+                            "tracked_finding": tracked,
+                        }),
+                    );
+                    self.persist_best_effort();
                     self.step += 1;
                 }
                 Decision::FileRead {
@@ -1357,7 +2436,22 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     self.step += 1;
                 }
                 Decision::FileWrite { path, content, reason } => {
-                    self.run_file_write(&path, &content, &reason, model_secs, &mut *emit);
+                    // Vault references in file content resolve out of band
+                    // too — a PoC that authenticates must not carry pasted
+                    // secrets into history or traces.
+                    match self.resolve_vault_refs_in_text(&content) {
+                        Ok(resolved) => {
+                            self.run_file_write(&path, &resolved, &reason, model_secs, &mut *emit)
+                        }
+                        Err(e) => {
+                            self.cm.set_last_error(Some(e.clone()));
+                            self.trace(
+                                crate::infra::trace::tag::DECISION_FILE_WRITE,
+                                format!("file write rejected (vault reference): {path}"),
+                                serde_json::json!({"path": path, "ok": false}),
+                            );
+                        }
+                    }
                     self.step += 1;
                 }
                 Decision::ReportFinding {
@@ -1384,20 +2478,113 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                         .find(|f| f.id == id)
                         .map(|f| f.status.clone())
                         .unwrap_or_else(|| "open".into());
+                    // Mirror into authoritative FindingStore (evidence-gated
+                    // lifecycle): same title+target converges, latest
+                    // evidence links, Hypothesis→Suspected when supported.
+                    let family = super::families::infer_family(&title, &detail).to_string();
+                    let tracked = self.assessment.findings.create(&title, &tgt, &family, &severity);
+                    if let Some(ev) = self.assessment.evidence.records.last() {
+                        if let Some(f) = self.assessment.findings.get_mut(tracked) {
+                            f.add_evidence(ev.id);
+                            let _ = f.transition(
+                                super::findings::FindingStage::Suspected,
+                                "model-reported with evidence on file",
+                            );
+                        }
+                    }
+                    let stage = self
+                        .assessment
+                        .findings
+                        .get(tracked)
+                        .map(|f| format!("{:?}", f.stage))
+                        .unwrap_or_else(|| "Hypothesis".into());
+                    // Weakness node keeps the graph honest about claimed
+                    // impact without hardcoding any attack chain.
+                    let wid = format!("weakness:finding-{tracked}");
+                    self.assessment.attack_graph.upsert_node(
+                        &wid,
+                        super::attack_graph::NodeKind::Weakness,
+                        &title,
+                        step,
+                    );
+                    self.mark_family_evidence(&family);
                     emit(Ev::FindingRecorded {
                         id,
-                        severity,
-                        title,
-                        target: tgt,
-                        status,
-                        detail,
+                        severity: severity.clone(),
+                        title: title.clone(),
+                        target: tgt.clone(),
+                        status: status.clone(),
+                        detail: detail.clone(),
                         step,
                     });
+                    emit(Ev::FindingUpdated {
+                        id: tracked,
+                        stage: stage.clone(),
+                        note: format!("family={family}"),
+                    });
+                    self.trace(
+                        crate::infra::trace::tag::FINDING_REPORTED,
+                        format!("finding F{id}/tracked-{tracked} [{severity}/{status}] {title}"),
+                        serde_json::json!({
+                            "registry_id": id,
+                            "tracked_id": tracked,
+                            "severity": severity,
+                            "title": title,
+                            "target": tgt,
+                            "family": family,
+                            "stage": stage,
+                        }),
+                    );
+                    self.persist_best_effort();
                     self.step += 1;
                 }
                 Decision::UpdateFinding { id, status, note } => {
                     let step = self.step;
                     if self.cm.update_finding(id, &status, step) {
+                        // Drive the authoritative lifecycle in lockstep:
+                        // confirmed → promote as far as evidence allows,
+                        // false_positive → Closed, anything else → note.
+                        // Map by title+target (stores can diverge by id).
+                        let norm = status.trim().to_lowercase();
+                        let (cm_title, cm_target) = self
+                            .cm
+                            .findings()
+                            .iter()
+                            .find(|f| f.id == id)
+                            .map(|f| (f.title.clone(), f.target.clone()))
+                            .unwrap_or_default();
+                        let tracked_id = self
+                            .assessment
+                            .findings
+                            .findings
+                            .iter()
+                            .find(|f| f.title == cm_title && f.target == cm_target)
+                            .map(|f| f.id)
+                            .unwrap_or_else(|| id.min(self.assessment.findings.findings.len().max(1)));
+                        let stage = if norm == "confirmed" {
+                            self.assessment
+                                .findings
+                                .promote_toward_validated(tracked_id, &note);
+                            self.assessment
+                                .findings
+                                .get(tracked_id)
+                                .map(|f| format!("{:?}", f.stage))
+                                .unwrap_or_else(|| "Suspected".into())
+                        } else if norm == "false_positive" || norm == "false-positive" {
+                            if let Some(f) = self.assessment.findings.get_mut(tracked_id) {
+                                let _ = f.transition(
+                                    super::findings::FindingStage::Closed,
+                                    &note,
+                                );
+                            }
+                            "Closed".to_string()
+                        } else {
+                            self.assessment
+                                .findings
+                                .get(tracked_id)
+                                .map(|f| format!("{:?}", f.stage))
+                                .unwrap_or_else(|| "Suspected".into())
+                        };
                         let (severity, title, target, detail) = self
                             .cm
                             .findings()
@@ -1421,10 +2608,26 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                             severity,
                             title,
                             target,
-                            status,
+                            status: status.clone(),
                             detail,
                             step,
                         });
+                        emit(Ev::FindingUpdated {
+                            id: tracked_id,
+                            stage: stage.clone(),
+                            note: note.clone(),
+                        });
+                        self.trace(
+                            crate::infra::trace::tag::FINDING_UPDATED,
+                            format!("finding F{id}/tracked-{tracked_id} -> {stage}"),
+                            serde_json::json!({
+                                "registry_id": id,
+                                "tracked_id": tracked_id,
+                                "status": status.clone(),
+                                "stage": stage,
+                            }),
+                        );
+                        self.persist_best_effort();
                     } else {
                         let known: Vec<String> = self
                             .cm
@@ -1449,8 +2652,8 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     kind,
                     source,
                 } => {
-                    // Values never touch events/records/logs — the event
-                    // carries the key only (see VaultStored).
+                    // Values never touch events/records/logs/traces — the
+                    // event carries the key only (see VaultStored).
                     let step = self.step;
                     match self.vault_mut() {
                         Err(e) => self.cm.set_last_error(Some(e)),
@@ -1460,7 +2663,18 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                 let kind = kind.trim().to_string();
                                 let key = key.trim().to_string();
                                 self.cm.set_vault_keys(keys);
-                                emit(Ev::VaultStored { key, kind, refreshed });
+                                emit(Ev::VaultStored {
+                                    key: key.clone(),
+                                    kind: kind.clone(),
+                                    refreshed,
+                                });
+                                self.trace(
+                                    crate::infra::trace::tag::VAULT_STORED,
+                                    format!("vault stored {key} [{kind}]"),
+                                    serde_json::json!({
+                                        "key": key, "kind": kind, "refreshed": refreshed,
+                                    }),
+                                );
                             }
                             Err(e) => self.cm.set_last_error(Some(e)),
                         },
@@ -1468,16 +2682,29 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                     self.step += 1;
                 }
                 Decision::VaultRecall { query } => {
-                    // The value is staged into the ContextManager (one
-                    // decision only) — never into an event or record.
+                    // Out-of-band values: the value is verified to exist
+                    // but NEVER staged into context. The next step's tail
+                    // confirms the key name and the `{{vault:key}}`
+                    // reference syntax — the model writes references, the
+                    // runtime injects values at execution time. Never into
+                    // an event, record, trace, or prompt.
                     match self.vault_mut() {
                         Err(e) => self.cm.set_last_error(Some(e)),
                         Ok(v) => match v.recall(&query) {
-                            Ok((key, value)) => {
-                                let (key, value) =
-                                    (key.to_string(), value.to_string());
-                                self.cm.recall_vault_value(&key, &value);
-                                emit(Ev::VaultRecalled { key });
+                            Ok((key, _value)) => {
+                                let key = key.to_string();
+                                self.cm.stage_model_note(
+                                    format!(
+                                        "vault recalled `{key}` — reference it as {{{{vault:{key}}}}} in tool options or file content; values are injected at execution and never shown"
+                                    ),
+                                    self.step,
+                                );
+                                emit(Ev::VaultRecalled { key: key.clone() });
+                                self.trace(
+                                    crate::infra::trace::tag::VAULT_RECALLED,
+                                    format!("vault recalled {key}"),
+                                    serde_json::json!({"key": key}),
+                                );
                             }
                             Err(e) => self.cm.set_last_error(Some(e)),
                         },
@@ -1496,12 +2723,55 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                         reason: reason.clone(),
                         model_secs,
                     });
-                    let request = CapabilityRequest {
+                    let mut request = CapabilityRequest {
                         capability,
                         target: action_target,
                         options,
                         reason,
                     };
+                    // Legacy migration BEFORE validation: strictly
+                    // well-formed `;`-separated header strings become
+                    // structured maps per the capability schema. Ambiguous
+                    // text stays a string and policy rejects it with an
+                    // actionable error (never silently merged).
+                    if let Some(def) = self.rt.caps.get(&request.capability) {
+                        super::policy::normalize_request_options(&def, &mut request.options);
+                    }
+                    // Out-of-band vault values: `{{vault:key}}` references
+                    // resolve HERE — after policy validated the reference
+                    // form, before anything executes or traces. Values
+                    // never enter prompts; traces carry sanitized_options
+                    // plus the sink-side secret registry. Unknown keys
+                    // fail like any argument error: feedback, no step.
+                    match self.resolve_vault_refs_in_options(&request.options) {
+                        Ok(opts) => request.options = opts,
+                        Err(e) => {
+                            emit(Ev::ActionRejected {
+                                reason: e.clone(),
+                            });
+                            self.cm.set_last_error(Some(e.clone()));
+                            self.trace(
+                                crate::infra::trace::tag::HARNESS_FEEDBACK,
+                                format!("vault reference failed: {e}"),
+                                serde_json::json!({
+                                    "capability": request.capability,
+                                    "target": request.target,
+                                }),
+                            );
+                            continue;
+                        }
+                    }
+                    self.trace(
+                        crate::infra::trace::tag::DECISION_EXECUTE,
+                        format!("{} on {}", request.capability, request.target),
+                        serde_json::json!({
+                            "capability": request.capability,
+                            "target": request.target,
+                            "options": sanitized_options(&request.options),
+                            "reason": request.reason,
+                            "model_secs": model_secs,
+                        }),
+                    );
                     // Validation order is a security property: policy
                     // (capability exists → arguments valid → scope → risk)
                     // runs BEFORE provider selection, so no out-of-scope
@@ -1524,12 +2794,28 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                     capability: request.capability.clone(),
                                     reason: msg,
                                 });
+                                self.trace(
+                                    crate::infra::trace::tag::APPROVAL_REQUESTED,
+                                    format!("approval requested for {}", request.capability),
+                                    serde_json::json!({
+                                        "capability": request.capability,
+                                        "target": request.target,
+                                    }),
+                                );
                                 match self.wait_for_approval() {
                                     ApprovalDecision::Allow => {
                                         self.approval_denied = false;
                                         // allow_destructive was latched with
                                         // the approval; the model's next
                                         // decision executes.
+                                        self.trace(
+                                            crate::infra::trace::tag::APPROVAL_DECIDED,
+                                            format!("approval allowed for {}", request.capability),
+                                            serde_json::json!({
+                                                "capability": request.capability,
+                                                "verdict": "allow",
+                                            }),
+                                        );
                                     }
                                     ApprovalDecision::Deny | ApprovalDecision::None => {
                                         // Deny (or no gate / timeout): the
@@ -1543,19 +2829,119 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                             reason: feedback.clone(),
                                         });
                                         self.cm.set_last_error(Some(feedback));
+                                        self.trace(
+                                            crate::infra::trace::tag::APPROVAL_DECIDED,
+                                            format!("approval denied for {}", request.capability),
+                                            serde_json::json!({
+                                                "capability": request.capability,
+                                                "verdict": "deny",
+                                            }),
+                                        );
                                     }
                                 }
                             } else {
                                 // Feed the rejection back; the model
                                 // self-corrects next iteration without
-                                // consuming a step.
+                                // consuming a step. The event keeps the terse
+                                // policy text (UI/tests); last_error carries
+                                // the structured recovery version.
                                 emit(Ev::ActionRejected {
                                     reason: msg.clone(),
                                 });
-                                self.cm.set_last_error(Some(msg));
+                                let category =
+                                    super::failure::FailureCategory::from_policy_error(&err);
+                                let recovery = category.recovery(
+                                    &request.capability,
+                                    &request.target,
+                                    &msg,
+                                );
+                                self.cm.set_last_error(Some(recovery.clone()));
+                                self.trace(
+                                    crate::infra::trace::tag::POLICY_REJECTED,
+                                    format!(
+                                        "policy rejected {} on {} [{}]",
+                                        request.capability,
+                                        request.target,
+                                        category.name()
+                                    ),
+                                    serde_json::json!({
+                                        "capability": request.capability,
+                                        "target": request.target,
+                                        "category": category.name(),
+                                        "reason": msg,
+                                    }),
+                                );
                             }
                         }
                         Ok(()) => {
+                            // Equivalent-request circuit breaker
+                            // (runtime-owned, never prompt advice): the same
+                            // request failing over and over means the request
+                            // is wrong, not the target. Block before burning
+                            // another execution + LLM round-trip. A retry is
+                            // allowed when the arguments changed (different
+                            // signature) or new evidence arrived since the
+                            // failures (world changed — outcome might too).
+                            const REPEAT_LIMIT: u32 = 3;
+                            const BREAKER_TRIP_CAP: u32 = 2;
+                            let sig = request_signature(&request);
+                            if self.repeat_fail_count >= REPEAT_LIMIT
+                                && self.repeat_fail_sig == sig
+                                && self.repeat_fail_state == self.state_version()
+                            {
+                                self.breaker_trips += 1;
+                                let remediation = format!(
+                                    "BLOCKED: `{}` on `{}` failed or was ineffective {} times in a row with equivalent arguments (last: {}). Do NOT retry the identical request — change the request arguments, try a different capability/target, record a finding, or reply to the user.",
+                                    request.capability,
+                                    request.target,
+                                    self.repeat_fail_count,
+                                    self.repeat_fail_last
+                                );
+                                emit(Ev::ActionBlocked {
+                                    reason: remediation.clone(),
+                                });
+                                self.cm.set_last_error(Some(remediation.clone()));
+                                self.trace(
+                                    crate::infra::trace::tag::BREAKER_BLOCKED,
+                                    format!(
+                                        "blocked {} on {} ({} fails, trip {})",
+                                        request.capability,
+                                        request.target,
+                                        self.repeat_fail_count,
+                                        self.breaker_trips
+                                    ),
+                                    serde_json::json!({
+                                        "capability": request.capability,
+                                        "target": request.target,
+                                        "fail_count": self.repeat_fail_count,
+                                        "trip": self.breaker_trips,
+                                        "last_error_head": self.repeat_fail_last,
+                                    }),
+                                );
+                                if self.breaker_trips >= BREAKER_TRIP_CAP {
+                                    let stuck = format!(
+                                        "I'm stuck: `{}` on `{}` keeps failing the same way and I kept retrying it instead of changing approach. {}",
+                                        request.capability, request.target, remediation
+                                    );
+                                    self.trace(
+                                        crate::infra::trace::tag::BREAKER_STUCK,
+                                        format!(
+                                            "stuck on {}|{}",
+                                            request.capability, request.target
+                                        ),
+                                        serde_json::json!({
+                                            "capability": request.capability,
+                                            "target": request.target,
+                                            "mode": if autonomous { "autonomous" } else { "interactive" },
+                                        }),
+                                    );
+                                    if autonomous {
+                                        return DriveOutcome::Finished(stuck);
+                                    }
+                                    return DriveOutcome::Replied(stuck);
+                                }
+                                continue;
+                            }
                             match self.rt.providers.select(
                                 &request.capability,
                                 &request.options,
@@ -1566,7 +2952,28 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                     emit(Ev::ActionRejected {
                                         reason: msg.clone(),
                                     });
-                                    self.cm.set_last_error(Some(msg));
+                                    let category =
+                                        super::failure::FailureCategory::from_provider_error(&err);
+                                    let recovery = category.recovery(
+                                        &request.capability,
+                                        &request.target,
+                                        &msg,
+                                    );
+                                    self.cm.set_last_error(Some(recovery));
+                                    self.trace(
+                                        crate::infra::trace::tag::PROVIDER_REJECTED,
+                                        format!(
+                                            "no provider for {} [{}]",
+                                            request.capability,
+                                            category.name()
+                                        ),
+                                        serde_json::json!({
+                                            "capability": request.capability,
+                                            "target": request.target,
+                                            "category": category.name(),
+                                            "reason": msg,
+                                        }),
+                                    );
                                 }
                                 Ok(provider) => {
                                     let provider_id = provider.id().to_string();
@@ -1574,6 +2981,19 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                         capability: request.capability.clone(),
                                         provider: provider_id.clone(),
                                     });
+                                    self.trace(
+                                        crate::infra::trace::tag::PROVIDER_SELECTED,
+                                        format!(
+                                            "{} -> {}",
+                                            request.capability, provider_id
+                                        ),
+                                        serde_json::json!({
+                                            "capability": request.capability,
+                                            "target": request.target,
+                                            "provider": provider_id,
+                                            "options": sanitized_options(&request.options),
+                                        }),
+                                    );
                                     let ctx = ExecutionContext {
                                         executor: executor.as_ref(),
                                         env: &self.env,
@@ -1596,7 +3016,35 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                             capability: request.capability.clone(),
                                             provider: provider_id.clone(),
                                         });
-                                        let result = provider.execute(&request, &ctx);
+                                        self.trace(
+                                            crate::infra::trace::tag::TOOL_ATTEMPT,
+                                            format!(
+                                                "{} on {} via {} (attempt {attempt}/{MAX_ATTEMPTS})",
+                                                request.capability, request.target, provider_id
+                                            ),
+                                            serde_json::json!({
+                                                "capability": request.capability,
+                                                "target": request.target,
+                                                "provider": provider_id,
+                                                "attempt": attempt,
+                                            }),
+                                        );
+                                        // First attempt reports the exact
+                                        // invocation (TOOL.ARGV / TOOL.HTTP_CALL
+                                        // from the provider); retries reuse it.
+                                        let result = if attempt == 1 {
+                                            let mut emit_trace =
+                                                |tag: &str, msg: String, data: serde_json::Value| {
+                                                    self.trace(tag, msg, data)
+                                                };
+                                            provider.execute_traced(
+                                                &request,
+                                                &ctx,
+                                                &mut emit_trace,
+                                            )
+                                        } else {
+                                            provider.execute(&request, &ctx)
+                                        };
                                         emit(Ev::ToolFinished {
                                             capability: request.capability.clone(),
                                             provider: provider_id.clone(),
@@ -1674,6 +3122,37 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                         ),
                                         tool_secs: exec_t0.elapsed().as_secs_f64(),
                                     });
+                                    self.trace(
+                                        crate::infra::trace::tag::TOOL_RESULT,
+                                        format!(
+                                            "{} on {} exit={} {} ({} attempts, {:.1}s)",
+                                            result.tool_id,
+                                            result.target,
+                                            result.exit_code,
+                                            if result.timed_out {
+                                                "timed out"
+                                            } else if result.success() {
+                                                "ok"
+                                            } else {
+                                                "failed"
+                                            },
+                                            attempt,
+                                            exec_t0.elapsed().as_secs_f64(),
+                                        ),
+                                        serde_json::json!({
+                                            "tool_id": result.tool_id,
+                                            "capability": result.capability,
+                                            "target": result.target,
+                                            "provider": provider_id,
+                                            "exit_code": result.exit_code,
+                                            "success": result.success(),
+                                            "timed_out": result.timed_out,
+                                            "attempts": attempt,
+                                            "stdout_len": result.stdout.len(),
+                                            "stderr_len": result.stderr.len(),
+                                            "non_retryable": result.is_non_retryable(),
+                                        }),
+                                    );
                                     // Raw evidence for the model: the
                                     // undistilled output rides the context
                                     // alongside the parsed observations.
@@ -1681,6 +3160,37 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                         &result.tool_id,
                                         &result.target,
                                         &result.combined_output(),
+                                    );
+                                    // Authoritative evidence log (write
+                                    // everything; the LLM reads selectively
+                                    // via the ContextManager projection).
+                                    let evid = self.assessment.evidence.push(
+                                        &result.capability,
+                                        &provider_id,
+                                        &result.tool_id,
+                                        &result.target,
+                                        &option_list,
+                                        &result.combined_output(),
+                                        result.timed_out,
+                                        result.success(),
+                                        self.step,
+                                    );
+                                    self.trace(
+                                        crate::infra::trace::tag::STATE_EVIDENCE,
+                                        format!(
+                                            "evidence #{evid}: {} via {} (success={})",
+                                            result.tool_id,
+                                            provider_id,
+                                            result.success()
+                                        ),
+                                        serde_json::json!({
+                                            "evidence_id": evid,
+                                            "tool_id": result.tool_id,
+                                            "capability": result.capability,
+                                            "target": result.target,
+                                            "provider": provider_id,
+                                            "success": result.success(),
+                                        }),
                                     );
                                     // Distill raw output into normalized
                                     // observations and feed BOTH stores — the
@@ -1693,14 +3203,113 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                             &result.combined_output(),
                                             &request.target,
                                         );
+                                        let raw_len = result.combined_output().len();
+                                        if parsed.is_empty() && raw_len > 0 {
+                                            // Parse miss: raw output is preserved
+                                            // as evidence but no parser understood
+                                            // it. Say so explicitly (with a Parse
+                                            // recovery note) instead of leaving
+                                            // the model guessing — unless a more
+                                            // specific error is already set.
+                                            if self.cm.last_error().is_none() {
+                                                let cat = super::failure::FailureCategory::Parse;
+                                                self.cm.set_last_error(Some(cat.recovery(
+                                                    &request.capability,
+                                                    &request.target,
+                                                    &format!(
+                                                        "tool={}, raw={} chars, parsed=0 observations (raw kept as evidence)",
+                                                        result.tool_id, raw_len
+                                                    ),
+                                                )));
+                                            }
+                                        }
+                                        self.trace(
+                                            crate::infra::trace::tag::PARSER_RESULT,
+                                            format!(
+                                                "parser {}: {} raw chars -> {} observations{}",
+                                                result.tool_id,
+                                                raw_len,
+                                                parsed.len(),
+                                                if parsed.is_empty() && raw_len > 0 {
+                                                    " (PARSE MISS)"
+                                                } else {
+                                                    ""
+                                                }
+                                            ),
+                                            serde_json::json!({
+                                                "tool_id": result.tool_id,
+                                                "raw_len": raw_len,
+                                                "parsed_n": parsed.len(),
+                                                "parse_miss": parsed.is_empty() && raw_len > 0,
+                                                "summaries": parsed.iter().map(|p| &p.summary).collect::<Vec<_>>(),
+                                            }),
+                                        );
                                         for p in &parsed {
                                             let step = self.step;
                                             self.cm.add_observation(
                                                 &p.target, &p.summary, &p.source, step,
                                             );
+                                            // Authoritative state update (generic):
+                                            // evidence log + entity merge + graph.
+                                            if let Some(detail) = &p.detail {
+                                                let kind = format!("{:?}", detail.kind());
+                                                let new_edges =
+                                                    self.assessment.apply_detail(detail, step);
+                                                self.trace(
+                                                    crate::infra::trace::tag::STATE_ENTITY,
+                                                    format!("entity {kind}: {}", p.summary.chars().take(120).collect::<String>()),
+                                                    serde_json::json!({
+                                                        "kind": kind,
+                                                        "summary": p.summary,
+                                                        "source": p.source,
+                                                    }),
+                                                );
+                                                for (from, to, kind) in &new_edges {
+                                                    self.trace(
+                                                        crate::infra::trace::tag::STATE_GRAPH_EDGE,
+                                                        format!("{from} -> {to} [{kind}]"),
+                                                        serde_json::json!({
+                                                            "from": from, "to": to, "kind": kind,
+                                                        }),
+                                                    );
+                                                }
+                                                // Scanner-confirmed weakness classes
+                                                // count as family evidence without
+                                                // auto-confirming a finding.
+                                                if let crate::model::observation::ObservationDetail::VulnerabilityFound { name, .. } = detail {
+                                                    let fam = super::families::infer_family(name, &p.summary);
+                                                    self.mark_family_evidence(fam);
+                                                }
+                                            }
+                                            self.assessment.touch(
+                                                super::assessment::now_unix(),
+                                                step,
+                                            );
                                             emit(Ev::ObservationAdded {
                                                 summary: p.summary.clone(),
                                             });
+                                        }
+                                        {
+                                            let n = self.assessment.attack_graph.nodes.len();
+                                            let e = self.assessment.attack_graph.edges.len();
+                                            if n > 0 {
+                                                emit(Ev::AttackGraphUpdated {
+                                                    nodes: n,
+                                                    edges: e,
+                                                    newly_reachable: self
+                                                        .assessment
+                                                        .attack_graph
+                                                        .newly_reachable(
+                                                            self.assessment
+                                                                .last_completed_step
+                                                                .saturating_sub(1),
+                                                        )
+                                                        .iter()
+                                                        .take(5)
+                                                        .map(|x| x.label.clone())
+                                                        .collect(),
+                                                });
+                                            }
                                         }
                                         // The empty-success explanation as a
                                         // first-class observation: the model
@@ -1729,16 +3338,42 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                         }
                                     }
                                     // Feed execution failures back so the model
-                                    // can self-correct on the next step.
+                                    // can self-correct on the next step. The
+                                    // feedback is structured: capability,
+                                    // category, sanitized facts, labeled
+                                    // suspicion, next diagnostic step.
                                     if !result.success() {
-                                        self.cm.set_last_error(Some(format!(
-                                            "{} on {} failed: {}",
+                                        let category =
+                                            super::failure::FailureCategory::from_tool_result(
+                                                &result,
+                                            );
+                                        let facts = format!(
+                                            "tool={}, exit={}, timed_out={}, {}",
                                             result.tool_id,
-                                            result.target,
+                                            result.exit_code,
+                                            result.timed_out,
                                             result.error.clone().unwrap_or_else(|| {
                                                 format!("exit code {}", result.exit_code)
                                             })
-                                        )));
+                                        );
+                                        let recovery = category.recovery(
+                                            &request.capability,
+                                            &request.target,
+                                            &facts,
+                                        );
+                                        self.cm.set_last_error(Some(recovery.clone()));
+                                        self.trace(
+                                            crate::infra::trace::tag::HARNESS_FEEDBACK,
+                                            format!(
+                                                "feedback [{}] to model",
+                                                category.name()
+                                            ),
+                                            serde_json::json!({
+                                                "capability": request.capability,
+                                                "target": request.target,
+                                                "category": category.name(),
+                                            }),
+                                        );
                                     }
                                     // Honest completion: an exit-0 run can
                                     // still have tested nothing (sqlmap
@@ -1763,7 +3398,19 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                                 step,
                                             );
                                             self.cm.set_last_error(Some(summary.clone()));
-                                            emit(Ev::ObservationAdded { summary });
+                                            emit(Ev::ObservationAdded { summary: summary.clone() });
+                                            self.trace(
+                                                crate::infra::trace::tag::TOOL_INEFFECTIVE,
+                                                format!(
+                                                    "{} on {} ineffective",
+                                                    result.tool_id, result.target
+                                                ),
+                                                serde_json::json!({
+                                                    "tool_id": result.tool_id,
+                                                    "target": result.target,
+                                                    "note": note,
+                                                }),
+                                            );
                                         }
                                     }
                                     let step = self.step;
@@ -1775,8 +3422,70 @@ impl<'r, 'a> AgentSession<'r, 'a> {
                                         request.reason.clone(),
                                         effective,
                                     );
+                                    // Repeat-failure breaker bookkeeping
+                                    // (decision-level: one outcome per
+                                    // Execute, not per retry attempt).
+                                    let err_head = if !result.success() {
+                                        result
+                                            .error
+                                            .as_deref()
+                                            .unwrap_or("")
+                                            .lines()
+                                            .next()
+                                            .unwrap_or("")
+                                            .to_string()
+                                    } else if !effective {
+                                        format!("{} ran but tested nothing (exit 0, ineffective)", result.tool_id)
+                                    } else {
+                                        String::new()
+                                    };
+                                    let was_success = result.success();
+                                    self.note_execution_outcome(
+                                        &request,
+                                        effective,
+                                        &err_head,
+                                    );
+                                    if !effective {
+                                        self.trace(
+                                            crate::infra::trace::tag::HARNESS_FEEDBACK,
+                                            format!(
+                                                "feedback to model: {} on {} {} (streak {})",
+                                                result.tool_id,
+                                                result.target,
+                                                if was_success { "ineffective" } else { "failed" },
+                                                self.repeat_fail_count
+                                            ),
+                                            serde_json::json!({
+                                                "tool_id": result.tool_id,
+                                                "target": result.target,
+                                                "repeat_sig": self.repeat_fail_sig,
+                                                "repeat_count": self.repeat_fail_count,
+                                            }),
+                                        );
+                                    } else {
+                                        // A capability that just succeeded may
+                                        // unblock objectives waiting on it.
+                                        let reopened = self
+                                            .assessment
+                                            .investigation
+                                            .reopen_blocked(&request.capability);
+                                        if !reopened.is_empty() {
+                                            self.trace(
+                                                crate::infra::trace::tag::STATE_REOPENED,
+                                                format!(
+                                                    "{} reopened {:?}",
+                                                    request.capability, reopened
+                                                ),
+                                                serde_json::json!({
+                                                    "capability": request.capability,
+                                                    "objective_ids": reopened,
+                                                }),
+                                            );
+                                        }
+                                    }
                                     self.tool_results.push(result);
                                     self.step += 1;
+                                    self.persist_best_effort();
                                 }
                             }
                         }
@@ -1788,6 +3497,8 @@ impl<'r, 'a> AgentSession<'r, 'a> {
 
     /// Consume the session into the headless result shape (CLI/tests).
     fn into_result(mut self, target: Target, finish_reason: FinishReason) -> InvestigationResult {
+        // Final snapshot so close/reopen restores the finished state.
+        self.persist_best_effort();
         let model_error = match &finish_reason {
             FinishReason::TooManyModelErrors { last_error, .. } => Some(last_error.clone()),
             _ => None,
@@ -2057,6 +3768,155 @@ mod tests {
         assert_eq!(res.steps_taken, 0);
     }
 
+    /// Fails the first N decides with Transport, then serves the script.
+    /// Records the rendered wire messages of every call.
+    struct FlakyProvider {
+        failures_left: std::sync::Mutex<usize>,
+        failure_text: String,
+        script: std::sync::Mutex<Vec<Decision>>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ModelProvider for FlakyProvider {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+        fn decide(&self, ctx: &ContextView) -> Result<Decision, ModelError> {
+            let rendered = serde_json::to_string(
+                &crate::agent::model::render_chat_messages(
+                    &ctx.brief,
+                    &ctx.transcript,
+                    &ctx.tail,
+                ),
+            )
+            .unwrap();
+            self.seen.lock().unwrap().push(rendered);
+            let mut left = self.failures_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err(ModelError::Transport(self.failure_text.clone()));
+            }
+            Ok(self.script.lock().unwrap().remove(0))
+        }
+        fn chat(&self, _system: &str, _user: &str) -> Result<String, ModelError> {
+            Ok("chat".into())
+        }
+    }
+
+    #[test]
+    fn model_retry_rebuilds_byte_identical_request() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (tools, caps, state) = harness(&[]);
+        let model: Box<dyn ModelProvider> = Box::new(FlakyProvider {
+            failures_left: Mutex::new(1),
+            failure_text: "boom: connection reset by peer".into(),
+            script: Mutex::new(vec![
+                Decision::Narrate {
+                    text: "working on it".into(),
+                },
+                Decision::Reply {
+                    text: "done".into(),
+                },
+            ]),
+            seen: Arc::clone(&seen),
+        });
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let mut sess = rt.session();
+        let outcome = sess.run_turn("go", &mut |_| {});
+        assert!(matches!(outcome, DriveOutcome::Replied(_)));
+        let seen = seen.lock().unwrap();
+        // fail, same-step retry, next step: 3 calls.
+        assert_eq!(seen.len(), 3);
+        // The retry is byte-identical: no error amendment leaks into the
+        // rebuilt request (the staged note stays hidden on the same step).
+        assert_eq!(seen[0], seen[1]);
+        // The failure surfaces in the NEXT step's tail instead.
+        assert!(
+            seen[2].contains("MODEL NOTE"),
+            "third call should carry the staged note: {}",
+            seen[2]
+        );
+        assert!(seen[2].contains("connection reset by peer"));
+    }
+
+    #[test]
+    fn slow_burn_failures_give_up_early() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (tools, caps, state) = harness(&[]);
+        // Always stalls: two burned budgets must end the turn, not five.
+        let model: Box<dyn ModelProvider> = Box::new(FlakyProvider {
+            failures_left: Mutex::new(99),
+            failure_text: "stream stalled: no data for 300s".into(),
+            script: Mutex::new(vec![]),
+            seen: Arc::clone(&seen),
+        });
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let mut sess = rt.session();
+        let outcome = sess.run_turn("go", &mut |_| {});
+        match outcome {
+            DriveOutcome::TooManyModelErrors { count, .. } => assert_eq!(count, 2),
+            other => panic!("expected early give-up, got {other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cancelled_model_error_ends_turn_without_retries() {
+        use std::sync::{Arc, Mutex};
+        // Stop pressed mid-call: the provider surfaces ModelError::
+        // Cancelled; the drive loop must end the turn as Cancelled —
+        // no error count, no retry, no user-facing failure.
+        struct CancelProvider {
+            calls: Arc<Mutex<usize>>,
+        }
+        impl ModelProvider for CancelProvider {
+            fn name(&self) -> &str {
+                "cancel"
+            }
+            fn decide(&self, _ctx: &ContextView) -> Result<Decision, ModelError> {
+                *self.calls.lock().unwrap() += 1;
+                Err(ModelError::Cancelled)
+            }
+            fn chat(&self, _system: &str, _user: &str) -> Result<String, ModelError> {
+                unreachable!("chat is not part of this path")
+            }
+        }
+        let calls = Arc::new(Mutex::new(0usize));
+        let (tools, caps, state) = harness(&[]);
+        let model: Box<dyn ModelProvider> = Box::new(CancelProvider {
+            calls: Arc::clone(&calls),
+        });
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let mut sess = rt.session();
+        let outcome = sess.run_turn("go", &mut |_| {});
+        assert!(matches!(outcome, DriveOutcome::Cancelled), "got {outcome:?}");
+        // Exactly one call: Cancelled must not be retried.
+        assert_eq!(*calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn retry_after_header_is_honored_and_capped() {        use std::sync::{Arc, Mutex};
+        let (tools, caps, state) = harness(&[]);
+        let model: Box<dyn ModelProvider> = Box::new(FlakyProvider {
+            failures_left: Mutex::new(1),
+            failure_text: "https://gw/v1: status code 429: busy [retry_after=1s]".into(),
+            script: Mutex::new(vec![Decision::Reply {
+                text: "recovered".into(),
+            }]),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        });
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let mut sess = rt.session();
+        // ~1s honored wait, then recovery — not the 100ms fast path and
+        // not an unbounded stall.
+        let t0 = std::time::Instant::now();
+        let outcome = sess.run_turn("go", &mut |_| {});
+        assert!(matches!(outcome, DriveOutcome::Replied(_)));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(900));
+    }
+
     #[test]
     fn session_reply_ends_turn_and_persists_conversation() {
         let (tools, caps, state) = harness(&["nmap"]);
@@ -2216,6 +4076,106 @@ mod tests {
             .policy
             .scope_roots()
             .contains(&"scanme.example.com".to_string()));
+    }
+
+    #[test]
+    fn mid_turn_message_is_folded_into_the_running_turn_without_stopping() {
+        // A message arrives mid-turn. It must NOT end the turn: instead it
+        // joins the conversation (so the model sees it next decision) and
+        // grants scope from any host it names — all within the same turn.
+        let (tools, caps, state) = harness(&["nmap"]);
+        // The model narrates once, then finishes — so the turn ends on the
+        // model's own terms, never because of the injected message.
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(vec![
+            Decision::Narrate { text: "working".into() },
+            Decision::Finish { reason: "done".into() },
+        ]));
+        // Deliver exactly one mid-turn message, on the first drain only.
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            "also check newtarget.example.com".to_string(),
+        ]));
+        let drain_src = std::sync::Arc::clone(&pending);
+        let rt = AgentRuntime::new(model, &tools, &caps, &state)
+            .with_input_drain(move || std::mem::take(&mut *drain_src.lock().unwrap()));
+        let mut sess = rt.session();
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let out = sess.run_turn("assess scanme.example.com", &mut |ev| seen.push(ev));
+        // The turn ended because the MODEL finished, not because of input.
+        assert!(matches!(out, DriveOutcome::Finished(_)), "got {out:?}");
+        // The injected message was folded in and surfaced as an event.
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::UserMessageSeen { text } if text == "also check newtarget.example.com"
+        )));
+        // Its host was granted scope mid-turn.
+        assert!(seen.iter().any(|e| matches!(
+            e,
+            AgentEvent::ScopeGranted { target } if target == "newtarget.example.com"
+        )));
+        assert!(sess
+            .policy
+            .scope_roots()
+            .contains(&"newtarget.example.com".to_string()));
+        // And it reached the model-facing conversation.
+        assert!(sess
+            .cm
+            .conversation()
+            .iter()
+            .any(|t| t.user == "also check newtarget.example.com"));
+    }
+
+    #[test]
+    fn pending_model_switch_is_applied_before_the_next_llm_call() {
+        // The operator switches providers mid-turn. The drive loop must swap
+        // the model at the next step boundary — BEFORE the next decision —
+        // so the new provider is the one that makes the call, not the old
+        // one that may be slow/broken (the grid-kimi-vs-opencode case).
+        let (tools, caps, state) = harness(&["nmap"]);
+        // A distinctly-named provider that just finishes, so we can assert
+        // which model actually ran the step.
+        struct Named(&'static str);
+        impl ModelProvider for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn decide(&self, _ctx: &ContextView) -> Result<Decision, ModelError> {
+                Ok(Decision::Finish { reason: "done".into() })
+            }
+            fn chat(&self, _s: &str, _u: &str) -> Result<String, ModelError> {
+                Ok("x".to_string())
+            }
+        }
+        // Reload hands back the NEW provider exactly once (the switch), then
+        // `None` forever after — mirroring a one-shot `swap_pending` flag.
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired_src = std::sync::Arc::clone(&fired);
+        let rt = AgentRuntime::new(Box::new(Named("old-provider")), &tools, &caps, &state)
+            .with_model_reload(move || {
+                if !fired_src.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let m: Box<dyn ModelProvider> = Box::new(Named("new-provider"));
+                    Some(m)
+                } else {
+                    None
+                }
+            });
+        assert_eq!(rt.model_name(), "old-provider");
+        let mut sess = rt.session();
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let _ = sess.run_turn("assess scanme.example.com", &mut |ev| seen.push(ev));
+        // The swap landed: the active model is now the new provider.
+        assert_eq!(
+            sess.rt.model_name(),
+            "new-provider",
+            "mid-turn switch must rebind the model before the next LLM call"
+        );
+        // And the switch surfaced to the UI as a status line.
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::Status { message } if message.contains("new-provider")
+            )),
+            "a model switch should emit a Status note"
+        );
     }
 
     #[test]
@@ -2699,6 +4659,83 @@ mod tests {
     }
 
     #[test]
+    fn full_resume_restores_what_rehydrate_alone_cannot() {
+        // rehydrate() replays the session LOG, which has no record kind
+        // for prior_actions or raw evidence at all — only the full
+        // (assessment + ContextManager) snapshot resume can bring those
+        // back. This proves the snapshot round-trip through the exact
+        // runtime entry points a reopen would use.
+        let (tools, caps, state) = harness(&["nmap"]);
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(vec![]));
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+
+        let mut sess = rt.session_with_id("resume-test-a1");
+        sess.policy.grant_scope("10.0.0.1");
+        sess.scope_label = "10.0.0.1".into();
+        sess.step = 7;
+        sess.cm.add_action(
+            7,
+            "network.port_scan".into(),
+            "nmap".into(),
+            "10.0.0.1".into(),
+            "map services".into(),
+            true,
+        );
+        sess.cm.add_evidence("nmap", "10.0.0.1", "22/tcp open ssh");
+        sess.cm.set_last_error(Some("connection refused on :8080".into()));
+        sess.cm.set_last_error(None);
+        sess.assessment.last_completed_step = 7;
+        sess.persist_best_effort();
+
+        // Simulate a process restart: load both snapshots fresh from disk
+        // and resume through the production entry point, exactly as a
+        // reopen would.
+        let loaded_assessment = super::super::assessment::load(&sess.assessment.id).unwrap();
+        let loaded_cm = super::super::context::load(&sess.assessment.id).unwrap();
+        let resumed = rt.resume_session_with_context(loaded_assessment, loaded_cm);
+
+        assert_eq!(resumed.step, 7, "step must not reset to 0 on resume");
+        // The regression this guards against: scope lives only in
+        // ExecutionPolicy (never itself serialized) and used to be
+        // restored solely by `rehydrate()`'s Rec::Target handling, which
+        // the full snapshot resume path does not call. Without syncing
+        // scope_label/target_roots onto AssessmentState, every action
+        // after a reopen rejected with "outside assessment scope ('')"
+        // even though the exact same target worked moments earlier.
+        assert_eq!(resumed.scope_label, "10.0.0.1", "scope label must survive resume");
+        assert!(
+            resumed.policy.scope_roots().contains(&"10.0.0.1".to_string()),
+            "granted scope roots must survive resume, got {:?}",
+            resumed.policy.scope_roots()
+        );
+        let request = CapabilityRequest {
+            capability: "network.port_scan".into(),
+            target: "10.0.0.1".into(),
+            options: OptionSet::new(),
+            reason: "re-scan after resume".into(),
+        };
+        assert!(
+            resumed.policy.validate(&request, &caps).is_ok(),
+            "a resumed session must be able to act on its own previously-granted target"
+        );
+        let target = Target::new("10.0.0.1");
+        let view = rt.context_view(&resumed.env, &target, resumed.step, &resumed.cm);
+        assert_eq!(view.prior_actions.len(), 1);
+        assert!(view.prior_actions[0].contains("map services"));
+        assert_eq!(view.recent_evidence.len(), 1);
+        assert_eq!(
+            view.recent_errors,
+            vec!["connection refused on :8080".to_string()]
+        );
+
+        // Clean up the snapshot files this test wrote under the real
+        // assessments dir.
+        let dir = super::super::assessment::assessments_dir();
+        let _ = std::fs::remove_file(dir.join("resume-test-a1.json"));
+        let _ = std::fs::remove_file(dir.join("resume-test-a1.context.json"));
+    }
+
+    #[test]
     fn tool_is_never_disabled_across_repeated_failures() {
         // Tools are never removed from the model. Repeated failure feeds
         // the model (last_error + the observations), and a later attempt
@@ -2740,6 +4777,269 @@ mod tests {
         assert!(!seen
             .iter()
             .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("disabled") || message.contains("disabled for"))));
+    }
+
+    #[test]
+    fn repeat_failure_breaker_blocks_identical_retries_then_ends_turn() {
+        // The same capability+target failing decision after decision means
+        // the request shape is wrong, not the target. After 3 consecutive
+        // failures the 4th identical decision is blocked without executing;
+        // a model that retries past the block ends the turn with a stuck
+        // explanation instead of burning calls forever.
+        let (tools, caps, state) = harness(&["nmap"]);
+        let script: Vec<Decision> = (0..6)
+            .map(|i| Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: format!("attempt {i}"),
+            })
+            .collect();
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(script));
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let flaky = Arc::new(FlakyExecutor::new("nmap", 100));
+        let rt = rt.with_executor(flaky.clone());
+        let mut sess = rt.session();
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let outcome = sess.run_turn("assess 10.0.0.1", &mut |ev| seen.push(ev));
+        // Exactly 3 executions happened (one per decision); the 4th
+        // identical decision was blocked, the 5th ended the turn.
+        let executed = seen
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecuted { .. }))
+            .count();
+        assert_eq!(executed, 3, "breaker must stop executions at 3, got {executed}");
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::ActionBlocked { reason } if reason.contains("BLOCKED")
+            )),
+            "breaker must emit ActionBlocked"
+        );
+        assert!(
+            matches!(&outcome, DriveOutcome::Replied(text) if text.contains("stuck")),
+            "turn must end with a stuck explanation, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn breaker_allows_retry_when_arguments_change() {
+        // Same capability+target with DIFFERENT options is a different
+        // request: after 3 identical failures, a changed-argument retry
+        // must execute instead of tripping the breaker.
+        let (tools, caps, state) = harness(&["nmap"]);
+        let mut script: Vec<Decision> = (0..3)
+            .map(|i| Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: format!("attempt {i}"),
+            })
+            .collect();
+        let mut changed = OptionSet::new();
+        changed.insert("ports".into(), OptionValue::Str("80,443".into()));
+        script.push(Decision::Execute {
+            capability: "network.port_scan".into(),
+            target: "10.0.0.1".into(),
+            options: changed,
+            reason: "same target, narrowed ports".into(),
+        });
+        script.push(Decision::Finish {
+            reason: "done".into(),
+        });
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(script));
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let flaky = Arc::new(FlakyExecutor::new("nmap", 100));
+        let rt = rt.with_executor(flaky.clone());
+        let mut sess = rt.session();
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let _ = sess.run_turn("assess 10.0.0.1", &mut |ev| seen.push(ev));
+        let executed = seen
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecuted { .. }))
+            .count();
+        assert_eq!(executed, 4, "changed-argument retry must execute, got {executed}");
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::ActionBlocked { .. }
+            )),
+            "breaker must not trip on changed arguments"
+        );
+    }
+
+    #[test]
+    fn breaker_rearms_after_new_evidence() {
+        // Three identical failures, then the world changes (a file write
+        // lands a new observation), then the identical request retries:
+        // the retry is allowed once because state advanced since the
+        // failures. A repeat after that re-trips the streak.
+        let (tools, caps, state) = harness(&["nmap"]);
+        let workroot = std::env::temp_dir().join(format!(
+            "medusa-breaker-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&workroot);
+        std::env::set_var("MEDUSA_WORK_ROOT", &workroot);
+        let script: Vec<Decision> = vec![
+            Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: "attempt 1".into(),
+            },
+            Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: "attempt 2".into(),
+            },
+            Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: "attempt 3".into(),
+            },
+            Decision::FileWrite {
+                path: "note.txt".into(),
+                content: "state change".into(),
+                reason: "record progress".into(),
+            },
+            Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: "retry after new evidence".into(),
+            },
+            Decision::Finish {
+                reason: "done".into(),
+            },
+        ];
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(script));
+        let rt = AgentRuntime::new(model, &tools, &caps, &state);
+        let flaky = Arc::new(FlakyExecutor::new("nmap", 100));
+        let rt = rt.with_executor(flaky.clone());
+        let mut sess = rt.session();
+        let mut seen: Vec<AgentEvent> = Vec::new();
+        let _ = sess.run_turn("assess 10.0.0.1", &mut |ev| seen.push(ev));
+        let nmap_runs = seen
+            .iter()
+            .filter(|e| {
+                matches!(e, AgentEvent::ToolExecuted { tool_id, .. } if tool_id == "nmap")
+            })
+            .count();
+        assert_eq!(
+            nmap_runs, 4,
+            "re-armed retry must execute after state changed, got {nmap_runs}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(
+                e,
+                AgentEvent::ActionBlocked { .. }
+            )),
+            "breaker must not trip when state advanced: {:?}",
+            seen.iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ActionBlocked { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&workroot);
+    }
+
+    #[test]
+    fn trace_captures_full_loop_sequence_in_order() {
+        use std::sync::{Arc, Mutex};
+        // Golden sequence: every stage of one failing Execute decision
+        // must appear in the trace in loop order, all tags CAPITAL.
+        let (tools, caps, state) = harness(&[]);
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(vec![Decision::Execute {
+            capability: "http.request".into(),
+            target: "http://127.0.0.1:9/".into(),
+            options: OptionSet::new(),
+            reason: "probe".into(),
+        }]));
+        let log: Arc<Mutex<Vec<crate::infra::trace::TraceEntry>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        let rt =
+            AgentRuntime::new(model, &tools, &caps, &state).with_tracer(move |e| {
+                log2.lock().unwrap().push(e)
+            });
+        let _ = rt.investigate(Target::new("127.0.0.1"));
+        let tags: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.tag.clone())
+            .collect();
+        // Tags are CAPITAL LETTERS only.
+        for t in &tags {
+            assert!(
+                t.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.' || c == '_'),
+                "tag not CAPITAL: {t}"
+            );
+        }
+        let expected = [
+            crate::infra::trace::tag::ASSESSMENT_START,
+            crate::infra::trace::tag::LLM_REQUEST,
+            crate::infra::trace::tag::LLM_RESPONSE,
+            crate::infra::trace::tag::DECISION_EXECUTE,
+            crate::infra::trace::tag::PROVIDER_SELECTED,
+            crate::infra::trace::tag::TOOL_ATTEMPT,
+            crate::infra::trace::tag::TOOL_HTTP_CALL,
+            crate::infra::trace::tag::TOOL_RESULT,
+            crate::infra::trace::tag::HARNESS_FEEDBACK,
+        ];
+        let mut pos = 0;
+        for want in expected {
+            match tags[pos..].iter().position(|t| t == want) {
+                Some(found) => pos += found + 1,
+                None => panic!("missing tag {want} in order; got: {tags:?}"),
+            }
+        }
+        // No secret values anywhere in the trace payloads.
+        let blob = serde_json::to_string(&*log.lock().unwrap()).unwrap();
+        assert!(
+            !blob.contains("Bearer eyJ"),
+            "credential leaked into trace"
+        );
+    }
+
+    #[test]
+    fn parse_miss_is_flagged_and_explained() {
+        use std::sync::{Arc, Mutex};
+        use crate::agent::executor::StubExecutor;
+        // Unparseable-but-nonempty tool output: the trace must flag the
+        // miss, and the model must get a Parse recovery note instead of
+        // silence (which previously caused re-probing loops).
+        let (tools, caps, state) = harness(&["nmap"]);
+        let model: Box<dyn ModelProvider> = Box::new(StubProvider::new(vec![
+            Decision::Execute {
+                capability: "network.port_scan".into(),
+                target: "10.0.0.1".into(),
+                options: OptionSet::new(),
+                reason: "scan".into(),
+            },
+            Decision::Finish {
+                reason: "done".into(),
+            },
+        ]));
+        let log: Arc<Mutex<Vec<crate::infra::trace::TraceEntry>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let log2 = Arc::clone(&log);
+        let rt = AgentRuntime::new(model, &tools, &caps, &state)
+            .with_executor(Arc::new(StubExecutor::success("nmap", "total nonsense, not xml")))
+            .with_tracer(move |e| log2.lock().unwrap().push(e));
+        let _ = rt.investigate(Target::new("10.0.0.1"));
+        let log = log.lock().unwrap();
+        let miss = log.iter().find(|e| {
+            e.tag == crate::infra::trace::tag::PARSER_RESULT
+                && e.data.get("parse_miss").and_then(|v| v.as_bool()) == Some(true)
+        });
+        assert!(miss.is_some(), "parse miss must be flagged in trace");
     }
 
     #[test]
@@ -2807,7 +5107,7 @@ mod tests {
         assert_eq!(seen[1].prior_actions.len(), 1);
         assert_eq!(
             seen[1].prior_actions[0],
-            "network.port_scan on 10.0.0.1 via nmap"
+            "network.port_scan on 10.0.0.1 via nmap [INEFFECTIVE] — ports unknown"
         );
     }
 
@@ -2875,9 +5175,11 @@ mod tests {
         use crate::agent::executor::StubExecutor;
         use std::sync::{Arc, Mutex};
 
-        // nmap output discovering an http port → world gets a host+port →
-        // Phase 6 derives the http-probe unknown → Phase 8 suggests the
-        // probe test. All of it must be visible in the model's next view.
+        // nmap output discovering an http port → AssessmentState gets
+        // host+port+graph nodes → completeness gate sees high-value
+        // unresolved objectives (http.probe via httpx is available) and
+        // rejects the first Finish proposal. Intentional behavior change:
+        // Finish is gated, not immediate.
         let nmap_xml = "<nmaprun><host><address addr=\"10.0.0.1\" addrtype=\"ipv4\"/>\
 <ports><port protocol=\"tcp\" portid=\"80\"><state state=\"open\"/>\
 <service name=\"http\" product=\"nginx\" version=\"1.24.0\"/></port></ports></host></nmaprun>";
@@ -2921,7 +5223,9 @@ mod tests {
         assert!(matches!(res.finish_reason, FinishReason::ModelFinished(_)));
 
         let seen = views.lock().unwrap().clone();
-        assert_eq!(seen.len(), 2);
+        // Scripted Finish is denied until the denial budget exhausts (gated
+        // completion), so more than the 2 scripted views are observed.
+        assert!(seen.len() > 2, "finish gating should add views, got {}", seen.len());
 
         // After the nmap result was parsed:
         let step1 = &seen[1];
@@ -3357,6 +5661,7 @@ mod tests {
                             prompt_tokens: 9000,
                             completion_tokens: 0,
                             total_tokens: 9000,
+                            cached_tokens: 0,
                             estimated: false,
                         },
                     )
@@ -3413,9 +5718,18 @@ mod tests {
             .expect("threshold crossing must compact");
         assert!(!fallback, "summarizer succeeds — no fallback");
         assert!(freed > 0, "compaction must free tokens");
-        // The decision AFTER the compaction still saw the registry
-        // finding (first decide ran before it was reported).
-        assert_eq!(*seen_findings.lock().unwrap(), vec![0, 1, 1]);
+        // The registry finding must survive compaction: the first decide
+        // ran before it was reported (0), and every decide after it —
+        // including the one past the compaction — still sees it (1). The
+        // loop may re-decide several times because the completeness engine
+        // rejects an early finish, so assert the invariant, not a fixed
+        // call count.
+        let seen = seen_findings.lock().unwrap();
+        assert_eq!(seen[0], 0, "first decide precedes the finding");
+        assert!(
+            seen[1..].iter().all(|&n| n == 1),
+            "finding must stay visible across compaction: {seen:?}"
+        );
         assert!(matches!(res.finish_reason, FinishReason::ModelFinished(_)));
     }
 }

@@ -14,7 +14,9 @@
 //!     "base_url": "https://provider.example.com/v1",
 //!     "api_key": "sk-...",
 //!     "model": "gpt-4o-mini",
-//!     "timeout_secs": 60
+//!     "timeout_secs": 600,
+//!     "connect_timeout_secs": 5,
+//!     "stream_idle_timeout_secs": 300
 //!   },
 //!   "providers": {
 //!     "my-gateway": {
@@ -51,7 +53,10 @@
 //! ```
 //!
 //! `"{prompt}"` is replaced with the model prompt; without it the prompt
-//! is appended as the last argument.
+//! is appended as the last argument — unless `"stdin_prompt": true`
+//! routes it through the harness's standard input instead (required on
+//! Windows, where command lines cap at ~32K chars and a full system
+//! prompt + context never fits in argv).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +77,9 @@ pub struct BuiltinProvider {
     /// `args` (see [`CliBackendConfig`]).
     pub command: Option<&'static str>,
     pub args: Option<&'static [&'static str]>,
+    /// Deliver the prompt on the harness's stdin instead of argv
+    /// (dropping any `"{prompt}"` slots from `args`).
+    pub stdin_prompt: bool,
 }
 
 pub const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
@@ -82,6 +90,7 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         default_model: Some("deepseek-ai/deepseek-v4.1-flash"),
         command: None,
         args: None,
+        stdin_prompt: false,
     },
     // Anthropic Claude via its OpenAI-compatible endpoint
     // (`{base}/chat/completions` with a Bearer key — the same wire
@@ -95,9 +104,11 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         default_model: Some("claude-opus-5-5"),
         command: None,
         args: None,
+        stdin_prompt: false,
     },
     // Claude Code CLI: uses the subscription login (`claude login`),
-    // not API credits. One-shot `-p` invocation per model call.
+    // not API credits. One-shot `-p` invocation per model call, prompt
+    // on stdin (argv cannot fit it on Windows).
     BuiltinProvider {
         id: "claude-code",
         base_url: None,
@@ -105,9 +116,10 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         default_model: None,
         command: Some("claude"),
         args: Some(&["-p", "{prompt}"]),
+        stdin_prompt: true,
     },
-    // opencode CLI, same one-shot shape (`opencode run <message>`).
-    // Authenticates via its own `opencode auth` setup.
+    // opencode CLI, same one-shot shape (`opencode run`, prompt on
+    // stdin). Authenticates via its own `opencode auth` setup.
     BuiltinProvider {
         id: "opencode",
         base_url: None,
@@ -115,6 +127,7 @@ pub const BUILTIN_PROVIDERS: &[BuiltinProvider] = &[
         default_model: None,
         command: Some("opencode"),
         args: Some(&["run", "{prompt}"]),
+        stdin_prompt: true,
     },
 ];
 
@@ -132,6 +145,17 @@ pub struct ModelFileConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Per-read idle budget for streamed responses — see
+    /// [`DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_SECS`]. Ignored for CLI
+    /// harnesses (no network phase; the overall timeout covers the
+    /// subprocess).
+    #[serde(default)]
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// Connect-phase budget (DNS + TCP + TLS) for HTTP backends — see
+    /// [`DEFAULT_MODEL_CONNECT_TIMEOUT_SECS`]. Ignored for CLI harnesses
+    /// (no network phase; the overall timeout covers the subprocess).
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
     /// Local harness executable (e.g. `"claude"`). When set, the model
     /// block resolves to a CLI backend: no base URL or key is needed.
     #[serde(default)]
@@ -141,6 +165,11 @@ pub struct ModelFileConfig {
     /// argument. E.g. `["-p", "{prompt}"]` for Claude Code.
     #[serde(default)]
     pub args: Option<Vec<String>>,
+    /// Send the prompt on the harness's stdin instead of argv, dropping
+    /// any `"{prompt}"` slots from `args`. Required for big prompts on
+    /// Windows (command lines cap at ~32K chars — `os error 206`).
+    #[serde(default)]
+    pub stdin_prompt: Option<bool>,
 }
 
 /// One named provider entry in the config file (custom gateways).
@@ -157,6 +186,14 @@ pub struct ProviderFileConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Per-read idle budget for streamed responses — see
+    /// [`ModelFileConfig::stream_idle_timeout_secs`].
+    #[serde(default)]
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// Connect-phase budget (DNS + TCP + TLS) — see
+    /// [`ModelFileConfig::connect_timeout_secs`].
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
     /// Local harness executable — see [`ModelFileConfig::command`].
     /// Takes precedence over `base_url`: a `command` entry always
     /// resolves to a CLI backend, never HTTP.
@@ -165,6 +202,10 @@ pub struct ProviderFileConfig {
     /// Static argv for the harness — see [`ModelFileConfig::args`].
     #[serde(default)]
     pub args: Option<Vec<String>>,
+    /// Prompt on stdin instead of argv — see
+    /// [`ModelFileConfig::stdin_prompt`].
+    #[serde(default)]
+    pub stdin_prompt: Option<bool>,
 }
 
 /// A resolved local-harness backend: what to spawn per model call.
@@ -174,6 +215,9 @@ pub struct CliBackendConfig {
     pub args: Vec<String>,
     pub label: String,
     pub timeout_secs: u64,
+    /// Feed the prompt to the harness's stdin (dropping `"{prompt}"`
+    /// slots from `args`) instead of argv.
+    pub stdin_prompt: bool,
 }
 
 /// A resolved model backend: an HTTP endpoint or a local harness
@@ -187,7 +231,7 @@ pub enum ModelBackend {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MedusaConfig {
+pub struct CipherConfig {
     /// Active provider name: selects from the builtin catalog or the
     /// `providers` map. Overridable via `MEDUSA_MODEL_PROVIDER`.
     #[serde(default)]
@@ -231,7 +275,7 @@ impl Default for ContextSettings {
 }
 
 pub fn resolve_context_settings(
-    file: &MedusaConfig,
+    file: &CipherConfig,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> ContextSettings {
     let tokens = lookup("MEDUSA_MODEL_CONTEXT_TOKENS")
@@ -265,20 +309,48 @@ pub fn config_path() -> std::path::PathBuf {
 /// by PowerShell `Set-Content -Encoding UTF8` and some Windows editors)
 /// is stripped — `serde_json` rejects BOM-prefixed text and a stray BOM
 /// must not silently wipe the whole config.
-pub fn load_file_config() -> MedusaConfig {
+pub fn load_file_config() -> CipherConfig {
     let path = config_path();
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     if text.trim().is_empty() {
-        return MedusaConfig::default();
+        return CipherConfig::default();
     }
     serde_json::from_str(text).unwrap_or_default()
 }
 
 /// Merge env over file over selected provider. `lookup` is injectable so
 /// tests never touch the real process environment.
+/// Per-attempt OVERALL timeout for EVERY LLM call (HTTP providers and
+/// local CLI harnesses alike), unless explicitly overridden per entry or
+/// via `MEDUSA_MODEL_TIMEOUT_SECS`. A backstop, not a pace: with streamed
+/// (SSE) responses the per-read idle timeout below is what detects a
+/// stalled call, while this only caps the total wall-clock per attempt.
+/// Generous on purpose (Claude Code uses 10 minutes) — a healthy
+/// generation that keeps producing tokens must never be cut short; dead
+/// endpoints are caught fast by the connect timeout below, not by this one.
+pub const DEFAULT_MODEL_TIMEOUT_SECS: u64 = 600;
+
+/// Per-read IDLE timeout for a streamed (SSE) HTTP response: how long the
+/// client waits for the NEXT chunk before declaring the call stalled.
+/// Resets on every received chunk, so long generations are fine as long as
+/// tokens keep flowing — this is the real hang detector. Overridable via
+/// `MEDUSA_MODEL_STREAM_IDLE_TIMEOUT_SECS` or a per-entry
+/// `stream_idle_timeout_secs`. Long on purpose: reasoning models can emit
+/// nothing for minutes while still working (Codex and opencode both use
+/// 300s chunk timeouts). Capped at the overall timeout at resolution.
+pub const DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Per-attempt CONNECT timeout for HTTP providers only (DNS + TCP +
+/// TLS handshake), overridable via `MEDUSA_MODEL_CONNECT_TIMEOUT_SECS` or
+/// a per-entry `connect_timeout_secs`. Deliberately short: an unreachable
+/// or hanging endpoint fails here in seconds, so the drive loop's 5
+/// retries exhaust quickly instead of burning the full overall timeout
+/// each time. Capped at the overall timeout at resolution.
+pub const DEFAULT_MODEL_CONNECT_TIMEOUT_SECS: u64 = 5;
+
 pub fn resolve_with(
-    file: &MedusaConfig,
+    file: &CipherConfig,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ModelBackend, ModelError> {
     let selected = nonempty(lookup("MEDUSA_MODEL_PROVIDER")).or_else(|| file.provider.clone());
@@ -289,7 +361,7 @@ pub fn resolve_with(
 /// does not apply) — used by the desktop switch to validate a choice
 /// before persisting it.
 pub fn resolve_selection(
-    file: &MedusaConfig,
+    file: &CipherConfig,
     selected: Option<&str>,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ModelBackend, ModelError> {
@@ -357,18 +429,34 @@ pub fn resolve_selection(
                     None
                 }
             });
-        // Local harnesses are slow (process spawn, subscription routing):
-        // default 300s, still overridable per entry or via env.
+        // Overall per-call timeout: the whole subprocess lifetime (see
+        // DEFAULT_MODEL_TIMEOUT_SECS); overridable per entry or via env.
+        // No connect sub-budget here — a CLI harness has no network
+        // phase; the fast-fail split only applies to HTTP providers.
         let timeout_secs = lookup("MEDUSA_MODEL_TIMEOUT_SECS")
             .and_then(|v| v.parse().ok())
             .or(entry_timeout)
-            .unwrap_or(300);
+            .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECS);
+        // Prompt channel follows the same precedence as args: custom
+        // entry, then builtin, then the unselected model block.
+        let entry_stdin: bool = custom
+            .and_then(|c| c.stdin_prompt)
+            .or_else(|| builtin.map(|b| b.stdin_prompt))
+            .or_else(|| {
+                if selected.is_none() {
+                    file.model.stdin_prompt
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
         return Ok(ModelBackend::Cli(CliBackendConfig {
             exe: exe.trim().to_string(),
             args: entry_args
                 .unwrap_or_else(|| vec!["{prompt}".to_string()]),
             label: selected.unwrap_or("cli").to_string(),
             timeout_secs,
+            stdin_prompt: entry_stdin,
         }));
     }
 
@@ -376,6 +464,8 @@ pub fn resolve_selection(
     let mut p_key: Option<String> = None;
     let mut p_model: Option<String> = None;
     let mut p_timeout: Option<u64> = None;
+    let mut p_connect_timeout: Option<u64> = None;
+    let mut p_stream_idle_timeout: Option<u64> = None;
     if selected.is_some() {
         p_base = custom
             .and_then(|c| c.base_url.clone())
@@ -410,6 +500,8 @@ pub fn resolve_selection(
             .and_then(|c| c.model.clone())
             .or_else(|| builtin.and_then(|b| b.default_model.map(str::to_string)));
         p_timeout = custom.and_then(|c| c.timeout_secs);
+        p_connect_timeout = custom.and_then(|c| c.connect_timeout_secs);
+        p_stream_idle_timeout = custom.and_then(|c| c.stream_idle_timeout_secs);
     }
 
     // Field precedence: MEDUSA_MODEL_* env > selected provider > model block.
@@ -440,12 +532,36 @@ pub fn resolve_selection(
         .and_then(|v| v.parse().ok())
         .or(p_timeout)
         .or(file.model.timeout_secs)
-        .unwrap_or(120);
+        .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECS);
+    // Connect-phase budget (DNS + TCP + TLS): same precedence chain, and
+    // never larger than the overall timeout (a longer connect cap would
+    // be meaningless — the overall deadline already binds).
+    let connect_timeout_secs = lookup("MEDUSA_MODEL_CONNECT_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .or(p_connect_timeout)
+        .or(file.model.connect_timeout_secs)
+        .unwrap_or(DEFAULT_MODEL_CONNECT_TIMEOUT_SECS)
+        .min(timeout_secs);
+    // Per-read idle budget for the streamed response: same precedence
+    // chain, also capped at the overall timeout (an explicit short
+    // overall deadline must still bind a silent connection).
+    let stream_idle_timeout_secs = lookup("MEDUSA_MODEL_STREAM_IDLE_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .or(p_stream_idle_timeout)
+        .or(file.model.stream_idle_timeout_secs)
+        .unwrap_or(DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_SECS)
+        .min(timeout_secs);
     Ok(ModelBackend::Http(OpenAiConfig {
         base_url,
         api_key,
         model,
         timeout_secs,
+        connect_timeout_secs,
+        stream_idle_timeout_secs,
+        // Per-session routing affinity is set programmatically
+        // (`set_session_key`), not from config — a config file cannot
+        // know session ids. `from_env` honors MEDUSA_MODEL_SESSION_KEY.
+        session_key: None,
     }))
 }
 
@@ -466,7 +582,7 @@ pub struct ProviderSummary {
 /// Every provider the user can switch to: the plain `model` block plus the
 /// builtin catalog plus custom `providers` entries (a custom entry with a
 /// builtin's id overrides it).
-pub fn list_provider_choices(file: &MedusaConfig) -> Vec<ProviderSummary> {
+pub fn list_provider_choices(file: &CipherConfig) -> Vec<ProviderSummary> {
     let mut out = Vec::new();
     let tag = file
         .model
@@ -516,7 +632,7 @@ pub fn list_provider_choices(file: &MedusaConfig) -> Vec<ProviderSummary> {
 /// Which provider is currently selected (env override wins, mirroring
 /// resolution).
 pub fn active_provider_id(
-    file: &MedusaConfig,
+    file: &CipherConfig,
     lookup: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
     nonempty(lookup("MEDUSA_MODEL_PROVIDER")).or_else(|| file.provider.clone())
@@ -563,7 +679,7 @@ pub fn set_provider_in_config(id: Option<&str>) -> Result<(), String> {
 }
 
 /// Production entry point: real process environment over the config file.
-pub fn resolve_model_config(file: &MedusaConfig) -> Result<ModelBackend, ModelError> {
+pub fn resolve_model_config(file: &CipherConfig) -> Result<ModelBackend, ModelError> {
     resolve_with(file, &|k| std::env::var(k).ok())
 }
 
@@ -586,7 +702,7 @@ mod tests {
 
     /// Resolve and unwrap the HTTP backend (all pre-existing tests are
     /// HTTP selections; CLI selections have their own tests below).
-    fn http(file: &MedusaConfig, env: &HashMap<&str, &str>) -> OpenAiConfig {
+    fn http(file: &CipherConfig, env: &HashMap<&str, &str>) -> OpenAiConfig {
         match resolve_with(file, &lookup(env)).unwrap() {
             ModelBackend::Http(cfg) => cfg,
             ModelBackend::Cli(_) => panic!("expected HTTP backend"),
@@ -594,7 +710,7 @@ mod tests {
     }
 
     /// Resolve and unwrap the CLI backend.
-    fn cli(file: &MedusaConfig, env: &HashMap<&str, &str>) -> CliBackendConfig {
+    fn cli(file: &CipherConfig, env: &HashMap<&str, &str>) -> CliBackendConfig {
         match resolve_with(file, &lookup(env)).unwrap() {
             ModelBackend::Cli(cfg) => cfg,
             ModelBackend::Http(_) => panic!("expected CLI backend"),
@@ -603,7 +719,7 @@ mod tests {
 
     #[test]
     fn empty_file_config_resolves_nothing() {
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let env = HashMap::new();
         assert!(resolve_with(&file, &lookup(&env)).is_err());
     }
@@ -611,7 +727,7 @@ mod tests {
     #[test]
     fn context_settings_default_and_resolve() {
         let env = HashMap::new();
-        let s = resolve_context_settings(&MedusaConfig::default(), &lookup(&env));
+        let s = resolve_context_settings(&CipherConfig::default(), &lookup(&env));
         assert_eq!(s, ContextSettings::default());
         assert_eq!(s.context_tokens, 128_000);
         // Env beats file; invalid values fall back to defaults.
@@ -622,9 +738,9 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             compaction_threshold_pct: Some(90),
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let s = resolve_context_settings(&file, &lookup(&env));
         assert_eq!(s.context_tokens, 64_000);
@@ -639,16 +755,19 @@ mod tests {
     #[test]
     fn file_values_fill_gaps_env_leaves() {
         let env = HashMap::new();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             model: ModelFileConfig {
                 base_url: Some("https://example.com/v1/".into()),
                 api_key: Some("k".into()),
                 model: Some("m".into()),
                 timeout_secs: Some(33),
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 command: None,
                 args: None,
+                stdin_prompt: None,
             },
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = http(&file, &env);
         assert_eq!(cfg.base_url, "https://example.com/v1"); // trailing slash trimmed
@@ -664,16 +783,19 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             model: ModelFileConfig {
                 base_url: Some("https://file.example.com/v1".into()),
                 api_key: Some("file-key".into()),
                 model: Some("from-file".into()),
                 timeout_secs: None,
+                connect_timeout_secs: None,
+                stream_idle_timeout_secs: None,
                 command: None,
                 args: None,
+                stdin_prompt: None,
             },
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = http(&file, &env);
         assert_eq!(cfg.model, "from-env");
@@ -683,7 +805,7 @@ mod tests {
 
     #[test]
     fn file_config_parses_from_json() {
-        let file: MedusaConfig = serde_json::from_str(
+        let file: CipherConfig = serde_json::from_str(
             r#"{"model":{"base_url":"https://x/v1","api_key":"k","model":"m"}}"#,
         )
         .unwrap();
@@ -698,7 +820,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let cfg = http(&file, &env);
         assert_eq!(cfg.base_url, "https://integrate.api.nvidia.com/v1");
         assert_eq!(cfg.api_key, "nv-secret");
@@ -708,9 +830,9 @@ mod tests {
     #[test]
     fn provider_selected_via_file_field() {
         let env: HashMap<&str, &str> = [("NVIDIA_API_KEY", "nv-secret")].into_iter().collect();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             provider: Some("nvidia".into()),
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = http(&file, &env);
         assert_eq!(cfg.model, "deepseek-ai/deepseek-v4.1-flash");
@@ -722,9 +844,9 @@ mod tests {
         // base URL with a Bearer key, so the shared provider speaks it
         // with no wire changes.
         let env: HashMap<&str, &str> = [("ANTHROPIC_API_KEY", "sk-ant-secret")].into_iter().collect();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             provider: Some("claude".into()),
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = http(&file, &env);
         assert_eq!(cfg.base_url, "https://api.anthropic.com/v1");
@@ -735,7 +857,7 @@ mod tests {
     #[test]
     fn missing_claude_key_names_the_env_var() {
         let env: HashMap<&str, &str> = [("MEDUSA_MODEL_PROVIDER", "claude")].into_iter().collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let err = resolve_with(&file, &lookup(&env)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("ANTHROPIC_API_KEY"), "error was: {msg}");
@@ -751,33 +873,33 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let cfg = http(&file, &env);
         assert_eq!(cfg.api_key, "sk-ant-secret");
     }
 
     #[test]
     fn builtin_cli_harness_resolves_without_a_key() {
-        // `opencode` needs no API key in Medusa config — it authenticates
+        // `opencode` needs no API key in Cipher config — it authenticates
         // itself (`opencode auth`). Resolution must not demand one.
         let env = HashMap::new();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             provider: Some("opencode".into()),
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = cli(&file, &env);
         assert_eq!(cfg.exe, "opencode");
         assert_eq!(cfg.args, vec!["run".to_string(), "{prompt}".to_string()]);
         assert_eq!(cfg.label, "opencode");
-        assert_eq!(cfg.timeout_secs, 300);
+        assert_eq!(cfg.timeout_secs, DEFAULT_MODEL_TIMEOUT_SECS);
     }
 
     #[test]
     fn builtin_claude_code_resolves_without_a_key() {
         let env = HashMap::new();
-        let file = MedusaConfig {
+        let file = CipherConfig {
             provider: Some("claude-code".into()),
-            ..MedusaConfig::default()
+            ..CipherConfig::default()
         };
         let cfg = cli(&file, &env);
         assert_eq!(cfg.exe, "claude");
@@ -788,7 +910,7 @@ mod tests {
     fn custom_command_wins_over_base_url_and_takes_timeout() {
         let env: HashMap<&str, &str> =
             [("MEDUSA_MODEL_TIMEOUT_SECS", "42")].into_iter().collect();
-        let file: MedusaConfig = serde_json::from_str(
+        let file: CipherConfig = serde_json::from_str(
             r#"{"provider":"local","providers":{"local":{"command":"myharness","args":["ask","{prompt}"],"timeout_secs":60,"base_url":"https://unused/v1"}}}"#,
         )
         .unwrap();
@@ -805,7 +927,7 @@ mod tests {
     #[test]
     fn model_block_command_resolves_cli_by_default() {
         let env = HashMap::new();
-        let file: MedusaConfig =
+        let file: CipherConfig =
             serde_json::from_str(r#"{"model":{"command":"claude"}}"#).unwrap();
         let cfg = cli(&file, &env);
         assert_eq!(cfg.exe, "claude");
@@ -815,8 +937,52 @@ mod tests {
     }
 
     #[test]
+    fn builtin_cli_harnesses_send_prompt_on_stdin() {
+        // A full system prompt + context never fits in argv on Windows
+        // (~32K cap, `os error 206`), so both CLI builtins use stdin.
+        let env = HashMap::new();
+        for id in ["opencode", "claude-code"] {
+            let file = CipherConfig {
+                provider: Some(id.into()),
+                ..CipherConfig::default()
+            };
+            let cfg = cli(&file, &env);
+            assert!(cfg.stdin_prompt, "{id} should use stdin");
+        }
+    }
+
+    #[test]
+    fn custom_stdin_prompt_flag_is_honored() {
+        let env = HashMap::new();
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"local","providers":{"local":{"command":"myharness","args":["run","{prompt}"],"stdin_prompt":true}}}"#,
+        )
+        .unwrap();
+        let cfg = cli(&file, &env);
+        assert_eq!(cfg.exe, "myharness");
+        // The template is kept as-is; the `{prompt}` slot is dropped at
+        // invoke time, when the bytes ride on stdin instead.
+        assert_eq!(cfg.args, vec!["run".to_string(), "{prompt}".to_string()]);
+        assert!(cfg.stdin_prompt);
+    }
+
+    #[test]
+    fn stdin_prompt_defaults_to_argv() {
+        // Absent flag: historical behavior — `{prompt}` substitution or
+        // append-last into argv.
+        let env = HashMap::new();
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"local","providers":{"local":{"command":"myharness"}}}"#,
+        )
+        .unwrap();
+        let cfg = cli(&file, &env);
+        assert!(!cfg.stdin_prompt);
+        assert!(!builtin_provider("nvidia").unwrap().stdin_prompt);
+    }
+
+    #[test]
     fn cli_choices_carry_cli_kind() {
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let choices = list_provider_choices(&file);
         let kinds: std::collections::HashMap<&str, &str> = choices
             .iter()
@@ -839,7 +1005,7 @@ mod tests {
             format!("\u{feff}{{\"model\":{{\"model\":\"glm-latest\"}}}}"),
         )
         .unwrap();
-        let parsed: MedusaConfig = serde_json::from_str(
+        let parsed: CipherConfig = serde_json::from_str(
             std::fs::read_to_string(&path)
                 .unwrap()
                 .trim_start_matches('\u{feff}'),
@@ -852,7 +1018,7 @@ mod tests {
     #[test]
     fn custom_provider_entry_with_api_key_env() {
         let env: HashMap<&str, &str> = [("GRID_KEY", "grid-secret")].into_iter().collect();
-        let file: MedusaConfig = serde_json::from_str(
+        let file: CipherConfig = serde_json::from_str(
             r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw.internal/v1/","api_key_env":"GRID_KEY","model":"m1","timeout_secs":42}}}"#,
         )
         .unwrap();
@@ -864,6 +1030,90 @@ mod tests {
     }
 
     #[test]
+    fn connect_timeout_default_entry_env_and_cap_precedence() {
+        // Defaults: 5s connect under a 60s overall budget.
+        let env: HashMap<&str, &str> = [("GRID_KEY", "k")].into_iter().collect();
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m"}}}"#,
+        )
+        .unwrap();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.timeout_secs, DEFAULT_MODEL_TIMEOUT_SECS);
+        assert_eq!(cfg.connect_timeout_secs, DEFAULT_MODEL_CONNECT_TIMEOUT_SECS);
+
+        // Per-entry override: 7s.
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m","connect_timeout_secs":7}}}"#,
+        )
+        .unwrap();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.connect_timeout_secs, 7);
+
+        // Env beats the entry: 3s.
+        let env: HashMap<&str, &str> = [
+            ("GRID_KEY", "k"),
+            ("MEDUSA_MODEL_CONNECT_TIMEOUT_SECS", "3"),
+        ]
+        .into_iter()
+        .collect();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.connect_timeout_secs, 3);
+
+        // Never larger than the overall timeout: capped to 4.
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m","timeout_secs":4,"connect_timeout_secs":7}}}"#,
+        )
+        .unwrap();
+        let env: HashMap<&str, &str> = [("GRID_KEY", "k")].into_iter().collect();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.connect_timeout_secs, 4);
+    }
+
+    #[test]
+    fn stream_idle_timeout_default_entry_env_and_cap_precedence() {
+        // Defaults: 300s per-read idle under a 600s overall budget.
+        let env: HashMap<&str, &str> = [("GRID_KEY", "k")].into_iter().collect();
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m"}}}"#,
+        )
+        .unwrap();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.timeout_secs, DEFAULT_MODEL_TIMEOUT_SECS);
+        assert_eq!(
+            cfg.stream_idle_timeout_secs,
+            DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_SECS
+        );
+
+        // Per-entry override: 120s.
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m","stream_idle_timeout_secs":120}}}"#,
+        )
+        .unwrap();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.stream_idle_timeout_secs, 120);
+
+        // Env beats the entry: 45s.
+        let env: HashMap<&str, &str> = [
+            ("GRID_KEY", "k"),
+            ("MEDUSA_MODEL_STREAM_IDLE_TIMEOUT_SECS", "45"),
+        ]
+        .into_iter()
+        .collect();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.stream_idle_timeout_secs, 45);
+
+        // Capped at an explicit short overall timeout.
+        let file: CipherConfig = serde_json::from_str(
+            r#"{"provider":"gw","providers":{"gw":{"base_url":"https://gw/v1","api_key_env":"GRID_KEY","model":"m","timeout_secs":60}}}"#,
+        )
+        .unwrap();
+        let env: HashMap<&str, &str> = [("GRID_KEY", "k")].into_iter().collect();
+        let cfg = http(&file, &env);
+        assert_eq!(cfg.timeout_secs, 60);
+        assert_eq!(cfg.stream_idle_timeout_secs, 60);
+    }
+
+    #[test]
     fn medusa_env_overrides_beat_the_selected_provider() {
         let env: HashMap<&str, &str> = [
             ("MEDUSA_MODEL_PROVIDER", "nvidia"),
@@ -872,7 +1122,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let cfg = http(&file, &env);
         assert_eq!(cfg.model, "other-model");
         assert_eq!(cfg.base_url, "https://integrate.api.nvidia.com/v1");
@@ -881,7 +1131,7 @@ mod tests {
     #[test]
     fn unknown_provider_fails_with_known_list() {
         let env: HashMap<&str, &str> = [("MEDUSA_MODEL_PROVIDER", "nope")].into_iter().collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let err = resolve_with(&file, &lookup(&env)).unwrap_err();
         assert!(format!("{err:?}").contains("unknown provider `nope`"));
     }
@@ -889,7 +1139,7 @@ mod tests {
     #[test]
     fn missing_provider_key_names_the_env_var() {
         let env: HashMap<&str, &str> = [("MEDUSA_MODEL_PROVIDER", "nvidia")].into_iter().collect();
-        let file = MedusaConfig::default();
+        let file = CipherConfig::default();
         let err = resolve_with(&file, &lookup(&env)).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("NVIDIA_API_KEY"), "error was: {msg}");
@@ -897,7 +1147,7 @@ mod tests {
 
     #[test]
     fn provider_choices_list_default_builtin_and_custom() {
-        let file: MedusaConfig = serde_json::from_str(
+        let file: CipherConfig = serde_json::from_str(
             r#"{"model":{"base_url":"https://grid.ai.juspay.net/","api_key":"k","model":"glm-latest"},"providers":{"gw":{"base_url":"https://gw/v1","model":"m1"}}}"#,
         )
         .unwrap();
@@ -915,7 +1165,7 @@ mod tests {
         );
         assert_eq!(choices[2].model.as_deref(), Some("claude-opus-5-5"));
         // A custom entry may override a builtin id.
-        let file2: MedusaConfig = serde_json::from_str(
+        let file2: CipherConfig = serde_json::from_str(
             r#"{"providers":{"nvidia":{"base_url":"https://mirror/v1","model":"m2"}}}"#,
         )
         .unwrap();
@@ -947,7 +1197,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let file: MedusaConfig = serde_json::from_str(
+        let file: CipherConfig = serde_json::from_str(
             r#"{"providers":{"gw":{"base_url":"https://gw/v1","api_key":"k","model":"m1"}}}"#,
         )
         .unwrap();

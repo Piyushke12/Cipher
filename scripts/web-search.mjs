@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Medusa web-search sidecar (browser fallback). The plain HTTP path
+// Cipher web-search sidecar (browser fallback). The plain HTTP path
 // (html.duckduckgo.com) serves a 202 bot challenge to non-browser
 // clients after a few queries; a real headless Chromium passes it. This
 // script searches DuckDuckGo in the browser and prints ONE JSON object:
@@ -45,29 +45,50 @@ const pw = await loadPlaywright().catch((e) => {
 });
 
 function extractResults() {
-  // Run in the page: collect result__a links, unwrapping DDG's
-  // redirect-wrapped hrefs (uddg param carries the real target).
-  const out = [];
-  const links = document.querySelectorAll("a.result__a");
-  const snippets = [...document.querySelectorAll(".result__snippet")].map((s) =>
-    s.textContent.replace(/\s+/g, " ").trim()
-  );
-  links.forEach((a, i) => {
-    let url = a.href || "";
+  // Run in the page. DuckDuckGo's markup varies by endpoint (html vs
+  // lite) and shifts over time, so try the known layouts, then fall back
+  // to any external result anchor. Hrefs are often redirect-wrapped
+  // (uddg param carries the real target) — unwrap them.
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const unwrap = (href) => {
     try {
-      const u = new URL(a.href, location.href);
-      const uddg = u.searchParams.get("uddg");
-      if (uddg) url = uddg;
+      const u = new URL(href, location.href);
+      return u.searchParams.get("uddg") || href;
     } catch {
-      /* keep a.href */
+      return href;
     }
-    out.push({
-      title: (a.textContent || "").replace(/\s+/g, " ").trim(),
-      url,
-      snippet: snippets[i] || "",
-    });
-  });
-  return out.slice(0, 10);
+  };
+  const fromAnchors = (sel, snipSel) => {
+    const anchors = [...document.querySelectorAll(sel)];
+    if (!anchors.length) return null;
+    const snips = snipSel
+      ? [...document.querySelectorAll(snipSel)].map(clean)
+      : [];
+    return anchors.slice(0, 10).map((a, i) => ({
+      title: clean(a.textContent),
+      url: unwrap(a.href),
+      snippet: snips[i] || "",
+    }));
+  };
+  // 1. html.duckduckgo.com  2. lite.duckduckgo.com
+  let out =
+    fromAnchors("a.result__a", ".result__snippet") ||
+    fromAnchors("a.result-link", ".result-snippet");
+  if (out && out.length) return out;
+  // 3. Generic fallback: external links that aren't DDG's own nav.
+  const seen = new Set();
+  out = [];
+  for (const a of document.querySelectorAll("a[href]")) {
+    const url = unwrap(a.href);
+    const title = clean(a.textContent);
+    if (!title || !/^https?:\/\//.test(url)) continue;
+    if (/(^|\.)duckduckgo\.com/.test(url)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push({ title, url, snippet: "" });
+    if (out.length >= 10) break;
+  }
+  return out;
 }
 
 const browser = await pw.chromium.launch({ headless: true });
@@ -81,17 +102,22 @@ try {
   let lastErr = "";
   for (const url of targets) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      // The anomaly challenge (if any) self-resolves in a real browser
-      // via JS + reload; wait for actual results to appear.
-      await page.waitForSelector("a.result__a, a.result-link", { timeout: 20000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+      // Give the anomaly challenge a brief chance to self-resolve, but do
+      // NOT hard-fail if the expected selector never shows — extract
+      // whatever the page has (the fallback handles shifted markup and
+      // partially-rendered challenge pages). Short timeout so a dead
+      // endpoint is cheap, not a 20s stall.
+      await page
+        .waitForSelector("a.result__a, a.result-link", { timeout: 6000 })
+        .catch(() => {});
       results = await page.evaluate(extractResults);
       if (results && results.length > 0) break;
     } catch (e) {
       lastErr = String(e && e.message ? e.message : e);
     }
   }
-  if (!results) {
+  if (!results || results.length === 0) {
     console.error(`no results extracted (${lastErr || "empty page"})`);
     process.exit(3);
   }

@@ -190,13 +190,19 @@ fn search_browser(query: &str) -> Result<Vec<WebResult>, String> {
         "--query".to_string(),
         query.to_string(),
     ];
+    // The sidecar caps its own per-target navigation (15s goto + 6s
+    // selector, two targets); this is the hard backstop if a headless
+    // Chromium hangs. Kept tight so a failing browser fallback costs
+    // ~30s, not a minute.
     let out = super::executor::spawn_with_timeout(
         &node.to_string_lossy(),
         &args,
-        Duration::from_secs(60),
+        None,
+        Duration::from_secs(45),
+        None,
     );
     if out.timed_out {
-        return Err("browser search timed out after 60s".into());
+        return Err("browser search timed out after 45s".into());
     }
     if let Some(e) = out.error {
         return Err(format!("failed to run browser search: {e}"));

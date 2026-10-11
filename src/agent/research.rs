@@ -25,9 +25,14 @@ use super::provider::{CapabilityProvider, CapabilityRequest, ExecutionContext};
 
 pub const RESEARCH_CAPABILITIES: [&str; 1] = ["web.research"];
 
-/// Cap on extracted text carried into evidence (chars). Research feeds the
-/// model's `recent_evidence`, which already caps per-entry.
+/// Width of the window returned to the model per fetch (chars). The full
+/// page is extracted internally; `grep`/`offset` choose WHICH window of it
+/// rides the evidence, so content past this width is reachable without a
+/// bigger context cost.
 const EXTRACT_CHARS: usize = 12_000;
+/// Chars kept BEFORE a `grep` match so the matched line has leading
+/// context (the match rarely wants to sit on the very first line).
+const GREP_LEAD_CHARS: usize = 400;
 /// Cap on an individual fetched page body before extraction.
 const FETCH_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// Default fetch timeout.
@@ -115,12 +120,67 @@ fn html_to_text(html: &str) -> String {
             ws = false;
         }
     }
-    result
-        .chars()
-        .take(EXTRACT_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    // Full extracted text (bounded only by the fetch cap). Windowing to
+    // EXTRACT_CHARS happens in `window_text` so grep/offset can reach
+    // content past the first window.
+    result.trim().to_string()
+}
+
+/// Outcome of windowing the full extract down to what rides the evidence.
+/// Shared with `http_provider` so a large HTTP body pages the same way a
+/// large research extract does (grep/offset), instead of hard-truncating.
+pub(crate) struct Window {
+    /// The slice returned to the model.
+    pub(crate) text: String,
+    /// Length of the FULL extract (so the model knows how much it skipped).
+    pub(crate) total_chars: usize,
+    /// Char offset the returned slice starts at.
+    pub(crate) offset: usize,
+    /// Set when a `grep` was requested: whether it matched.
+    pub(crate) grep_matched: Option<bool>,
+}
+
+/// Select a `width`-wide window to return. With `grep`, center on the first
+/// case-insensitive match (with lead context); otherwise start at `offset`.
+/// Char-boundary safe. A non-matching grep returns an empty slice flagged
+/// `grep_matched: Some(false)` so the model knows to try a different pattern
+/// rather than assuming the content is absent. Shared by `http_provider`.
+pub(crate) fn window_text(full: &str, grep: Option<&str>, offset: usize, width: usize) -> Window {
+    let chars: Vec<char> = full.chars().collect();
+    let total = chars.len();
+    if let Some(pat) = grep.map(str::trim).filter(|p| !p.is_empty()) {
+        let hay = full.to_lowercase();
+        let needle = pat.to_lowercase();
+        match hay.find(&needle) {
+            Some(byte_idx) => {
+                // Translate the byte index into a char index.
+                let char_idx = full[..byte_idx].chars().count();
+                let start = char_idx.saturating_sub(GREP_LEAD_CHARS);
+                let end = (start + width).min(total);
+                Window {
+                    text: chars[start..end].iter().collect(),
+                    total_chars: total,
+                    offset: start,
+                    grep_matched: Some(true),
+                }
+            }
+            None => Window {
+                text: String::new(),
+                total_chars: total,
+                offset: 0,
+                grep_matched: Some(false),
+            },
+        }
+    } else {
+        let start = offset.min(total);
+        let end = (start + width).min(total);
+        Window {
+            text: chars[start..end].iter().collect(),
+            total_chars: total,
+            offset: start,
+            grep_matched: None,
+        }
+    }
 }
 
 /// Replace `script`/`style` blocks (with their inner text) with a space,
@@ -155,10 +215,15 @@ fn strip_blocks(html: &str, tags: &[&str]) -> String {
     out
 }
 
-fn fetch_text(url: &str, timeout: Duration) -> Result<ToolResult, String> {
+fn fetch_text(
+    url: &str,
+    grep: Option<&str>,
+    offset: usize,
+    timeout: Duration,
+) -> Result<ToolResult, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
-        .user_agent("Medusa/0.1 (security-research; contact local-operator)")
+        .user_agent("Cipher/0.1 (security-research; contact local-operator)")
         .build();
     let resp = agent.get(url).call().map_err(|e| format!("fetch failed: {e}"))?;
     let status = resp.status();
@@ -169,22 +234,46 @@ fn fetch_text(url: &str, timeout: Duration) -> Result<ToolResult, String> {
     reader.read_to_end(&mut body).map_err(|e| format!("read failed: {e}"))?;
     let body_str = String::from_utf8_lossy(&body);
     let is_html = content_type.contains("html");
-    let text = if is_html { html_to_text(&body_str) } else { body_str.trim().chars().take(EXTRACT_CHARS).collect::<String>() };
-    let evidence = serde_json::json!({
+    // Full extract first, then window it — so grep/offset can reach past
+    // the first EXTRACT_CHARS of a large file instead of only its head.
+    let full = if is_html {
+        html_to_text(&body_str)
+    } else {
+        body_str.trim().to_string()
+    };
+    let win = window_text(&full, grep, offset, EXTRACT_CHARS);
+    let mut evidence = serde_json::json!({
         "url": url,
         "status": status,
         "content_type": content_type,
-        "extracted_chars": text.len(),
-        "text": text,
+        "total_chars": win.total_chars,
+        "offset": win.offset,
+        "returned_chars": win.text.chars().count(),
+        "text": win.text,
     });
-    let tool_id = "medusa-research".to_string();
-    let target = url.to_string();
-    let cap = "web.research".to_string();
+    if let Some(matched) = win.grep_matched {
+        evidence["grep"] = serde_json::json!(grep.unwrap_or("").trim());
+        evidence["grep_matched"] = serde_json::json!(matched);
+        if !matched {
+            evidence["note"] = serde_json::json!(
+                "grep pattern not found in the extract — try a different/shorter pattern, or omit grep and use offset to page through"
+            );
+        }
+    } else if win.offset + win.text.chars().count() < win.total_chars {
+        // More content remains past this window: tell the model how to get it.
+        evidence["note"] = serde_json::json!(format!(
+            "{} of {} chars shown from offset {}; more remains — pass grep=<text> to jump to a section, or offset={} to continue",
+            win.text.chars().count(),
+            win.total_chars,
+            win.offset,
+            win.offset + win.text.chars().count()
+        ));
+    }
     let stdout = serde_json::to_string(&evidence).unwrap_or_default();
     Ok(ToolResult {
-        tool_id,
-        capability: cap,
-        target,
+        tool_id: "medusa-research".to_string(),
+        capability: "web.research".to_string(),
+        target: url.to_string(),
         exit_code: 0,
         stdout,
         stderr: String::new(),
@@ -208,7 +297,7 @@ impl CapabilityProvider for ResearchProvider {
     }
 
     fn supports_option(&self, _capability: &str, option: &str) -> bool {
-        matches!(option, "selector")
+        matches!(option, "selector" | "grep" | "offset")
     }
 
     fn is_available(&self, _env: &crate::model::EnvironmentState) -> bool {
@@ -216,29 +305,54 @@ impl CapabilityProvider for ResearchProvider {
     }
 
     fn execute(&self, request: &CapabilityRequest, _ctx: &ExecutionContext) -> ToolResult {
-        // The request target is the URL to read. `selector` is accepted
-        // but not yet used (kept so the schema is forward-compatible) —
-        // extraction is whole-page for now.
+        // The request target is the URL to read. `grep`/`offset` window the
+        // extract so large files are reachable past the first page;
+        // `selector` is accepted but not yet used (whole-page extraction).
         let target = request.target.trim();
-
         if target.is_empty() {
-            ToolResult::error_non_retryable(
+            return ToolResult::error_non_retryable(
                 "medusa-research",
                 &request.capability,
                 "",
                 "web.research requires a target URL".into(),
-            )
-        } else {
-            match fetch_text(target, self.timeout) {
-                Ok(res) => res,
-                Err(e) => ToolResult::error_non_retryable(
-                    "medusa-research",
-                    &request.capability,
-                    &request.target,
-                    e,
-                ),
-            }
+            );
         }
+        let grep = match request.options.get("grep") {
+            Some(crate::agent::model::OptionValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let offset = match request.options.get("offset") {
+            Some(crate::agent::model::OptionValue::Num(n)) if *n >= 0.0 => *n as usize,
+            _ => 0,
+        };
+        match fetch_text(target, grep.as_deref(), offset, self.timeout) {
+            Ok(res) => res,
+            Err(e) => ToolResult::error_non_retryable(
+                "medusa-research",
+                &request.capability,
+                &request.target,
+                e,
+            ),
+        }
+    }
+
+    fn execute_traced(
+        &self,
+        request: &CapabilityRequest,
+        ctx: &ExecutionContext,
+        trace: &mut dyn FnMut(&str, String, serde_json::Value),
+    ) -> ToolResult {
+        trace(
+            crate::infra::trace::tag::TOOL_RESEARCH,
+            format!("fetch {}", request.target.chars().take(120).collect::<String>()),
+            serde_json::json!({
+                "provider": "medusa-research",
+                "capability": request.capability,
+                "target_len": request.target.len(),
+                "timeout_secs": self.timeout.as_secs(),
+            }),
+        );
+        self.execute(request, ctx)
     }
 }
 
@@ -255,6 +369,42 @@ mod tests {
         assert!(text.contains("code();"));
         assert!(!text.contains("alert(1)"));
         assert!(!text.contains("<h1>"));
+    }
+
+    #[test]
+    fn grep_jumps_to_a_match_deep_in_a_large_extract() {
+        // A body far larger than one window, with the needle well past the
+        // first EXTRACT_CHARS — the old head-only extract could never reach
+        // it; grep must.
+        let mut full = "A".repeat(EXTRACT_CHARS * 2);
+        full.push_str("NEEDLE_svgInjectionChallenge_here");
+        full.push_str(&"B".repeat(500));
+        let win = window_text(&full, Some("svgInjectionChallenge"), 0, EXTRACT_CHARS);
+        assert_eq!(win.grep_matched, Some(true));
+        assert!(win.text.contains("svgInjectionChallenge"), "window must contain the match");
+        assert!(win.offset > EXTRACT_CHARS, "window must start deep in the file, got {}", win.offset);
+        assert!(win.text.chars().count() <= EXTRACT_CHARS);
+    }
+
+    #[test]
+    fn grep_miss_is_flagged_not_silently_empty() {
+        let win = window_text("hello world", Some("notpresent"), 0, EXTRACT_CHARS);
+        assert_eq!(win.grep_matched, Some(false));
+        assert!(win.text.is_empty());
+    }
+
+    #[test]
+    fn offset_pages_through_and_reports_total() {
+        let full = "0123456789".repeat(2000); // 20_000 chars
+        let first = window_text(&full, None, 0, EXTRACT_CHARS);
+        assert_eq!(first.total_chars, 20_000);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.text.chars().count(), EXTRACT_CHARS);
+        // Second page starts where the first ended and reaches new content.
+        let second = window_text(&full, None, EXTRACT_CHARS, EXTRACT_CHARS);
+        assert_eq!(second.offset, EXTRACT_CHARS);
+        assert!(second.text.chars().count() > 0);
+        assert!(second.grep_matched.is_none());
     }
 
     #[test]

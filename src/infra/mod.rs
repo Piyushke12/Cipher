@@ -8,6 +8,7 @@ pub mod platform;
 pub mod runner;
 pub mod scripts;
 pub mod sessions;
+pub mod trace;
 
 pub use cache::{cache_path, load_state, save_state, state_is_fresh};
 pub use config::{
@@ -20,3 +21,4 @@ pub use runner::RealCommandRunner;
 pub use sessions::{
     list_sessions, load_session, SessionRecord, SessionSummary, SessionWriter, TimedRecord,
 };
+pub use trace::{tag as trace_tag, TraceEntry, TraceWriter};

@@ -24,6 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::model::ContextView;
+use super::model::TranscriptMsg;
 use super::runtime::Target;
 
 /// One normalized finding from a tool run. Parsers (Phase 5) produce these;
@@ -87,7 +88,7 @@ fn default_true() -> bool {
 }
 
 /// Char-approximated context ceiling for one decision prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBudget {
     /// Maximum serialized characters (~4 chars â‰ˆ 1 token).
     pub max_chars: usize,
@@ -116,11 +117,15 @@ pub struct BudgetReport {
 
 /// Investigation memory + the selection policy that turns it into a
 /// [`ContextView`]. One instance per investigation; the runtime owns it.
-#[derive(Debug, Clone, Default)]
+/// Serializable so the runtime can snapshot it whole to disk (see
+/// [`save`]/[`load`]) and restore it on a session reopen, instead of
+/// relying only on the session log's lossy, field-by-field replay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextManager {
     observations: Vec<Observation>,
     actions: Vec<ActionRecord>,
     last_error: Option<String>,
+    error_history: Vec<String>,
     budget: TokenBudget,
     /// User/assistant turns (unified chat+agent loop). Unbounded: the
     /// model sees the full dialogue verbatim. Context-overflow handling
@@ -139,20 +144,51 @@ pub struct ContextManager {
     /// the view and never summarized away by compaction.
     findings: Vec<Finding>,
     /// Vault KEY NAMES visible in context (values never live here).
+    /// Excluded from the snapshot: reloaded live from the per-target
+    /// vault file, never from this persistence path.
+    #[serde(skip)]
     vault_keys: Vec<String>,
     /// Recalled vault values for the NEXT decision only (`key=value`
     /// lines). Cleared by the runtime after one decision (least
     /// exposure); never persisted, never emitted.
+    #[serde(skip)]
     vault_values: Vec<String>,
     /// Set when the conversation was compacted: the view carries a note
     /// pointing the model at the summary turn.
     compacted: bool,
     /// How many times auto/manual compaction ran this session.
     pub compaction_count: usize,
+    /// Count of findings the user had already been told about as of the
+    /// last narration. Findings appended beyond this count are ones the
+    /// model recorded but has NOT yet announced — the harness turns that
+    /// gap into a `pending_narration` directive in the view (see
+    /// [`Self::pending_narration_note`]) so a confirmed win is never left
+    /// sitting silently in state while the model moves on to the next tool.
+    #[serde(default)]
+    findings_narrated: usize,
+    /// Append-only wire transcript (see [`TranscriptMsg`]): conversation
+    /// turns plus per-step event messages, oldest first. Pushed at
+    /// recording time, never rewritten except at the compaction boundary,
+    /// so consecutive requests share a byte-identical prefix. Persisted
+    /// with the snapshot — resume restores identical history.
+    #[serde(default)]
+    transcript: Vec<TranscriptMsg>,
+    /// Model-call failure note staged for the NEXT step's tail (see
+    /// [`Self::stage_model_note`]). Never touches same-step retries, so
+    /// retries stay byte-identical.
+    #[serde(default)]
+    staged_model_note: Option<String>,
+    /// First step at which `staged_model_note` may appear.
+    #[serde(default)]
+    staged_note_step: usize,
+    /// Assessment mode for the brief (`true` = autonomous CLI assess).
+    /// Set once per turn by the runtime; stable within a session.
+    #[serde(default)]
+    autonomous: bool,
 }
 
 /// One raw tool output kept for model visibility.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct EvidenceEntry {
     tool_id: String,
     target: String,
@@ -169,11 +205,27 @@ const MAX_EVIDENCE_ENTRIES: usize = 10;
 /// Observations retained across a compaction. Findings carry the durable
 /// conclusions; observations past this cap are expendable history.
 const MAX_OBSERVATIONS_AFTER_COMPACT: usize = 50;
-/// Loopback/HTTP requests are payload verification targets: the rendered
-/// body often sits mid-page, so these get the full allowance.
-const EVIDENCE_FULL_CAP_TOOL: &str = "medusa-http";
+/// Transcript messages retained verbatim across a compaction, newest
+/// first fill (Codex keeps ~20k tokens of recent messages; opencode
+/// ~15k). The summary carries the rest.
+const TRANSCRIPT_TAIL_CHARS: usize = 20_000;
+/// Tools whose raw output the model must READ in full, not just
+/// acknowledge, so they get the whole per-entry allowance instead of
+/// half: `medusa-http` (payload-verification bodies — the rendered
+/// SSTI/SQLi/IDOR result often sits mid-page) and `medusa-research`
+/// (fetched source/docs/CVE pages — the exact line that matters, e.g. a
+/// challenge's solve condition, can sit anywhere in the extract).
+const EVIDENCE_FULL_CAP_TOOLS: &[&str] = &["medusa-http", "medusa-research"];
 /// How many user-facing updates the model remembers sending.
 const MAX_NARRATIONS: usize = 15;
+const MAX_ERROR_HISTORY: usize = 6;
+const ERROR_HISTORY_ENTRY_CAP: usize = 240;
+/// Effective actions with no new finding before the harness warns the
+/// model it is likely thrashing (permuting the same attempt against an
+/// unchanged success check) and should change approach. Tuned so a
+/// normal multi-step exploit chain does not trip it, but an hour of
+/// payload permutations does.
+const STALL_ACTIONS_WITHOUT_FINDING: usize = 8;
 
 fn evidence_line(e: &EvidenceEntry) -> String {
     format!("[{}] {}:\n{}", e.tool_id, e.target, e.output)
@@ -192,7 +244,9 @@ impl ContextManager {
     }
 
     /// Record a parsed observation. Exact-duplicate summaries are collapsed
-    /// (the first occurrence is kept). Returns the observation id.
+    /// (the first occurrence is kept). Returns the observation id. A new
+    /// observation also appends one transcript message (cache-stable: the
+    /// stored line, never re-rendered later).
     pub fn add_observation(
         &mut self,
         target: &str,
@@ -204,17 +258,21 @@ impl ContextManager {
             return existing.id;
         }
         let id = self.observations.len() + 1;
-        self.observations.push(Observation {
+        let obs = Observation {
             id,
             target: target.to_string(),
             summary: summary.to_string(),
             source: source.to_string(),
             step,
-        });
+        };
+        let line = observation_line(&obs);
+        self.observations.push(obs);
+        self.push_user(line);
         id
     }
 
-    /// Record a validated execute decision.
+    /// Record a validated execute decision. Also appends one transcript
+    /// message (the model's own action, assistant role).
     pub fn add_action(
         &mut self,
         step: usize,
@@ -224,33 +282,63 @@ impl ContextManager {
         reason: String,
         effective: bool,
     ) {
-        self.actions.push(ActionRecord {
+        let record = ActionRecord {
             step,
             capability,
             provider,
             target,
             reason,
             effective,
-        });
+        };
+        let line = action_line(&record);
+        self.actions.push(record);
+        self.push_assistant(line);
     }
 
     /// Feedback channel for self-correction: policy rejections and model
     /// errors. Always included in the next view.
     pub fn set_last_error(&mut self, error: Option<String>) {
+        if let Some(e) = &error {
+            let trimmed = e.trim();
+            if !trimmed.is_empty() {
+                let entry: String = trimmed.chars().take(ERROR_HISTORY_ENTRY_CAP).collect();
+                if self.error_history.last().map(String::as_str) != Some(entry.as_str()) {
+                    self.error_history.push(entry);
+                    let overflow = self
+                        .error_history
+                        .len()
+                        .saturating_sub(MAX_ERROR_HISTORY);
+                    if overflow > 0 {
+                        self.error_history.drain(0..overflow);
+                    }
+                }
+            }
+        }
         self.last_error = error;
+    }
+
+    /// Read-only view of the current feedback line (repeat-failure
+    /// breaker remediation text). Full error stays in the ContextView.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     /// Open a turn: records the user message with an empty assistant
     /// reply. [`Self::end_turn`] fills the reply when the turn completes.
+    /// The user text also opens the wire transcript.
     pub fn begin_turn(&mut self, user: &str) {
         self.conversation.push(crate::agent::model::ChatTurn {
             user: user.to_string(),
             assistant: String::new(),
         });
+        self.push_user(user.to_string());
     }
 
     /// Close the turn opened by [`Self::begin_turn`] with the assistant
-    /// text that ended it (reply or finish reason).
+    /// text that ended it (reply or finish reason). Conversation only —
+    /// the transcript already carries every decision as an assistant
+    /// message (pushed by the runtime per decision), so pushing here
+    /// would duplicate the reply.
     pub fn end_turn(&mut self, assistant: &str) {
         if let Some(last) = self.conversation.last_mut() {
             last.assistant = assistant.to_string();
@@ -262,10 +350,78 @@ impl ContextManager {
         self.conversation.last()
     }
 
+    /// Fold a user message that arrived mid-turn into the conversation so
+    /// the model sees it on its next decision. Unlike [`Self::begin_turn`]
+    /// this does not imply a turn boundary — the running turn continues;
+    /// its closing [`Self::end_turn`] still fills the latest turn's reply.
+    pub fn inject_user_message(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.conversation.push(crate::agent::model::ChatTurn {
+            user: trimmed.to_string(),
+            assistant: String::new(),
+        });
+        self.push_user(trimmed.to_string());
+    }
+
     /// Full conversation (oldest first). Used for compaction materials
     /// and window estimates — never serialized to session records.
     pub fn conversation(&self) -> &[crate::agent::model::ChatTurn] {
         &self.conversation
+    }
+
+    /// Append a user message to the wire transcript. Empty text is
+    /// ignored. Never rewrites history — the cache prefix property
+    /// depends on this being append-only between compactions.
+    pub fn push_user(&mut self, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+        self.transcript
+            .push(crate::agent::model::TranscriptMsg::user(content));
+    }
+
+    /// Append an assistant message to the wire transcript. Empty text is
+    /// ignored. The runtime calls this once per model decision with the
+    /// rendered decision, so the model's own prior outputs replay
+    /// verbatim on the next step.
+    pub fn push_assistant(&mut self, content: String) {
+        if content.trim().is_empty() {
+            return;
+        }
+        self.transcript
+            .push(crate::agent::model::TranscriptMsg::assistant(content));
+    }
+
+    /// The wire transcript, oldest first. Byte-stable across steps:
+    /// callers must only ever extend the returned prefix by appending.
+    pub fn transcript(&self) -> &[crate::agent::model::TranscriptMsg] {
+        &self.transcript
+    }
+
+    /// Assessment mode for the brief. Set once per turn by the runtime.
+    pub fn set_autonomous(&mut self, autonomous: bool) {
+        self.autonomous = autonomous;
+    }
+
+    /// Stage a model-call failure note for the NEXT step's tail. The note
+    /// is hidden from views built for `current_step` itself, so a
+    /// same-step retry rebuilds a byte-identical request; it surfaces in
+    /// the first view of a later step. Replaces any previously staged
+    /// note. Cleared on turn end and compaction.
+    pub fn stage_model_note(&mut self, note: String, current_step: usize) {
+        if note.trim().is_empty() {
+            return;
+        }
+        self.staged_note_step = current_step.saturating_add(1);
+        self.staged_model_note = Some(note);
+    }
+
+    /// Drop any staged model note (turn end, give-up, compaction).
+    pub fn clear_staged_model_note(&mut self) {
+        self.staged_model_note = None;
     }
 
     /// Mark a replayed compaction (session reload): the model sees the
@@ -287,7 +443,7 @@ impl ContextManager {
         if trimmed.is_empty() {
             return;
         }
-        let cap = if tool_id == EVIDENCE_FULL_CAP_TOOL {
+        let cap = if EVIDENCE_FULL_CAP_TOOLS.contains(&tool_id) {
             EVIDENCE_ENTRY_CAP
         } else {
             EVIDENCE_ENTRY_CAP / 2
@@ -305,11 +461,29 @@ impl ContextManager {
         } else {
             trimmed.to_string()
         };
-        self.evidence.push(EvidenceEntry {
+        // Drop a byte-identical re-fetch of the same tool+target (e.g. the
+        // model re-running `web.research` on the same URL and getting the
+        // same windowed head): it adds no new information and a 12k dump
+        // repeated several times just crowds the window. The existing
+        // entry already rides the view. Compared AFTER truncation so the
+        // stored (capped) forms are what's matched.
+        if self
+            .evidence
+            .iter()
+            .any(|e| e.tool_id == tool_id && e.target == target && e.output == output)
+        {
+            return;
+        }
+        let entry = EvidenceEntry {
             tool_id: tool_id.to_string(),
             target: target.to_string(),
             output,
-        });
+        };
+        let line = evidence_line(&entry);
+        self.evidence.push(entry);
+        // Transcript is append-only: ring eviction below affects the
+        // legacy array only, never recorded messages.
+        self.push_user(line);
         let overflow = self.evidence.len().saturating_sub(MAX_EVIDENCE_ENTRIES);
         if overflow > 0 {
             self.evidence.drain(0..overflow);
@@ -318,17 +492,75 @@ impl ContextManager {
 
     /// Record an update sent to the user (narrate decision or turn-end
     /// reply). The model sees these so it does not re-announce findings
-    /// it already reported. Newest kept, bounded.
+    /// it already reported. Newest kept, bounded. Also appends the text
+    /// as an assistant transcript message (the model's own words).
     pub fn add_narration(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return;
         }
         self.narrations.push(trimmed.to_string());
+        self.push_assistant(trimmed.to_string());
         let overflow = self.narrations.len().saturating_sub(MAX_NARRATIONS);
         if overflow > 0 {
             self.narrations.drain(0..overflow);
         }
+        // Everything confirmed so far has now been announced: clear the
+        // pending-narration backlog so the nudge does not re-fire for
+        // findings this narration already covered.
+        self.findings_narrated = self.findings.len();
+    }
+
+    /// Directive injected into the view when findings have been recorded
+    /// but not yet narrated: names them and tells the model to announce
+    /// what it found before running the next tool. `None` when the user
+    /// is already up to date. This is the harness-enforced half of the
+    /// "communicate what you found" contract — it does not depend on the
+    /// model remembering the system prompt.
+    fn pending_narration_note(&self) -> Option<String> {
+        let unnarrated = self.findings.get(self.findings_narrated..)?;
+        if unnarrated.is_empty() {
+            return None;
+        }
+        let names: Vec<String> = unnarrated
+            .iter()
+            .map(|f| format!("F{} {} ({})", f.id, f.title, f.target))
+            .collect();
+        Some(format!(
+            "You have recorded {} finding(s) the user has NOT been told about yet: {}. \
+             Before your next execute/web_search, send a `narrate` in plain language saying \
+             what you found and what it means for the target. Do not restate findings already \
+             listed in `narrations`.",
+            names.len(),
+            names.join("; ")
+        ))
+    }
+
+    /// Directive injected when the agent has run many effective actions
+    /// without recording a new finding — the signature of thrashing
+    /// (permuting the same attempt against an unchanged success check).
+    /// `None` until the threshold is crossed. Counts actions taken AFTER
+    /// the most recent finding (or all actions when none exist yet).
+    fn strategy_hint(&self) -> Option<String> {
+        let last_finding_step = self.findings.iter().map(|f| f.step_found).max();
+        let since = self
+            .actions
+            .iter()
+            .filter(|a| last_finding_step.map_or(true, |s| a.step > s))
+            .count();
+        if since < STALL_ACTIONS_WITHOUT_FINDING {
+            return None;
+        }
+        Some(format!(
+            "You have run {since} actions with no NEW finding. If you are repeating variations of \
+             the same attempt (same endpoint/payload class) against an unchanged success check, \
+             STOP permuting — it is not working. Change approach: (1) read the target's own source \
+             to learn the EXACT trigger — for an open-source app use `web.research` to fetch the \
+             relevant source file (e.g. a raw GitHub URL) and read the precise condition, rather \
+             than guessing; (2) if a plain HTTP request can reproduce what a browser would send, \
+             prefer that over repeated browser loads; (3) try a fundamentally different vector. \
+             Do not keep permuting the same payload."
+        ))
     }
 
     fn recent_conversation(&self) -> Vec<crate::agent::model::ChatTurn> {
@@ -446,6 +678,11 @@ impl ContextManager {
     /// `MAX_OBSERVATIONS_AFTER_COMPACT`. Findings, vault keys, narrations,
     /// and actions survive verbatim — compaction must never lose track
     /// of what was confirmed or what the user was told.
+    ///
+    /// The wire transcript gets the same boundary treatment: the summary
+    /// becomes the first exchange, then the most recent messages fitting
+    /// `TRANSCRIPT_TAIL_CHARS` ride verbatim. A compaction is the one
+    /// accepted cache reset; everything after it appends again.
     pub fn compact(&mut self, summary: &str, keep_turns: usize) {
         let keep = keep_turns.min(self.conversation.len());
         let tail: Vec<crate::agent::model::ChatTurn> =
@@ -456,6 +693,27 @@ impl ContextManager {
             assistant: summary.to_string(),
         });
         self.conversation.extend(tail);
+        let mut kept: Vec<crate::agent::model::TranscriptMsg> = Vec::new();
+        let mut used = 0usize;
+        for m in self.transcript.iter().rev() {
+            let cost = m.content.len().saturating_add(8);
+            if !kept.is_empty() && used.saturating_add(cost) > TRANSCRIPT_TAIL_CHARS {
+                break;
+            }
+            used = used.saturating_add(cost);
+            kept.push(m.clone());
+        }
+        kept.reverse();
+        self.transcript = vec![
+            crate::agent::model::TranscriptMsg::user(
+                "[Earlier context compacted — read the assistant summary, then continue.]".to_string(),
+            ),
+            crate::agent::model::TranscriptMsg::assistant(summary.to_string()),
+        ];
+        self.transcript.extend(kept);
+        // A staged note refers to a pre-compaction step: drop it rather
+        // than surfacing stale directives after the boundary.
+        self.staged_model_note = None;
         self.evidence.clear();
         let overflow = self
             .observations
@@ -474,6 +732,102 @@ impl ContextManager {
 
     pub fn actions(&self) -> &[ActionRecord] {
         &self.actions
+    }
+
+    /// Stable engagement brief: target, mode, capabilities, schemas,
+    /// vault key names, findings registry. Byte-stable head — only the
+    /// findings section at its end grows, append-only, so consecutive
+    /// steps share the prefix.
+    fn build_brief(
+        &self,
+        target: &Target,
+        available_capabilities: &[String],
+        unavailable_count: usize,
+        capability_schemas: &[String],
+    ) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("TARGET: {}\n", target.address));
+        out.push_str(&format!(
+            "MODE: {}\n",
+            if self.autonomous {
+                "autonomous — drive to finish, never reply"
+            } else {
+                "interactive — reply ends the turn"
+            }
+        ));
+        out.push_str(&format!(
+            "CAPABILITIES ({} available, {} unavailable): {}\n",
+            available_capabilities.len(),
+            unavailable_count,
+            available_capabilities.join(", ")
+        ));
+        if capability_schemas.is_empty() {
+            out.push_str("CAPABILITY SCHEMAS: (none)\n");
+        } else {
+            out.push_str("CAPABILITY SCHEMAS:\n");
+            for s in capability_schemas {
+                out.push_str(s);
+                out.push('\n');
+            }
+        }
+        out.push_str("VAULT KEYS (names only — use {{vault:key}} references in tool options; values are injected at execution):\n");
+        if self.vault_keys.is_empty() {
+            out.push_str("(vault empty)\n");
+        } else {
+            for k in &self.vault_keys {
+                out.push_str(k);
+                out.push('\n');
+            }
+        }
+        out.push_str("FINDINGS (complete registry — trust over summaries):\n");
+        let findings = self.finding_lines();
+        if findings.is_empty() {
+            out.push_str("(none yet)\n");
+        } else {
+            for f in &findings {
+                out.push_str(f);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Volatile per-step directives, regenerated every call. Sections are
+    /// omitted when empty (deterministic). Never cached — this is the one
+    /// message allowed to change every step.
+    fn build_tail(&self, step: usize) -> String {
+        let mut out = format!("STEP: {step}\n");
+        if let Some(e) = self.last_error.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.push_str(&format!("LAST ERROR (fix this next): {e}\n"));
+        }
+        if !self.error_history.is_empty() {
+            out.push_str("RECENT ERRORS:\n");
+            for e in &self.error_history {
+                out.push_str(&format!("- {e}\n"));
+            }
+        }
+        if step >= self.staged_note_step {
+            if let Some(note) = self
+                .staged_model_note
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                out.push_str(&format!("MODEL NOTE: {note}\n"));
+            }
+        }
+        if self.compacted {
+            out.push_str(&format!(
+                "CONTEXT: conversation compacted {} time(s); older turns are summarized in the first message. The findings registry in the brief is complete — trust it over the summary.\n",
+                self.compaction_count
+            ));
+        }
+        if let Some(note) = self.pending_narration_note() {
+            out.push_str(&format!("DIRECTIVE (pending_narration): {note}\n"));
+        }
+        if let Some(hint) = self.strategy_hint() {
+            out.push_str(&format!("STRATEGY: {hint}\n"));
+        }
+        out
     }
 
     /// Build the budgeted view for one model call.
@@ -522,6 +876,7 @@ impl ContextManager {
                 .map(|s| s.len() + 8)
                 .sum::<usize>()
             + self.last_error.as_ref().map_or(0, |e| e.len() + 24)
+            + self.error_history.iter().map(|e| e.len() + 8).sum::<usize>()
             + 160; // JSON skeleton, field names, slack
 
         let remaining = self.budget.max_chars.saturating_sub(essentials);
@@ -556,6 +911,14 @@ impl ContextManager {
             target: target.address.clone(),
             step,
             autonomous: false,
+            brief: self.build_brief(
+                target,
+                &available_capabilities,
+                unavailable_count,
+                &capability_schemas,
+            ),
+            transcript: self.transcript.clone(),
+            tail: self.build_tail(step),
             conversation: self.recent_conversation(),
             available_capabilities,
             unavailable_count,
@@ -565,6 +928,7 @@ impl ContextManager {
             prior_actions,
             capability_schemas,
             last_error: self.last_error.clone(),
+            recent_errors: self.error_history.clone(),
             findings: self.finding_lines(),
             vault_keys: self.vault_keys.clone(),
             vault_values: self.vault_values.clone(),
@@ -574,6 +938,15 @@ impl ContextManager {
                     self.compaction_count
                 )
             }),
+            // AssessmentState projection fills these after build; the
+            // manager itself stays a pure budgeted selector, never the
+            // system of record for graph/family/completion state.
+            attack_summary: Vec::new(),
+            family_progress: Vec::new(),
+            unknowns: Vec::new(),
+            completion_note: None,
+            pending_narration: self.pending_narration_note(),
+            strategy_hint: self.strategy_hint(),
         };
         report.total_chars = serde_json::to_string(&view)
             .map(|s| s.len())
@@ -582,12 +955,81 @@ impl ContextManager {
     }
 }
 
+/// Schema version for the on-disk [`ContextManager`] snapshot. Bump this
+/// when the struct's shape changes in a way old files can't deserialize
+/// into; [`load_in`] rejects a mismatch instead of returning a partially
+/// (or incorrectly) populated manager.
+pub const CONTEXT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ContextSnapshot {
+    schema_version: u32,
+    cm: ContextManager,
+}
+
+/// Persist a [`ContextManager`] snapshot for `id` under `dir`. Shares the
+/// assessment id and directory convention with
+/// [`super::assessment::save_in`] (`assessments_dir()`, same id, sibling
+/// file) so the two snapshots that make up a resumable session — the
+/// authoritative world model and the model-facing context — stay keyed
+/// together.
+pub fn save_in(dir: &std::path::Path, id: &str, cm: &ContextManager) -> Result<(), String> {
+    if !super::assessment::is_valid_id(id) {
+        return Err(format!("invalid context snapshot id: {id}"));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("create context dir: {e}"))?;
+    let snapshot = ContextSnapshot {
+        schema_version: CONTEXT_SCHEMA_VERSION,
+        cm: cm.clone(),
+    };
+    let text = serde_json::to_string_pretty(&snapshot).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(dir.join(format!("{id}.context.json")), text)
+        .map_err(|e| format!("write context snapshot: {e}"))?;
+    Ok(())
+}
+
+/// Load a [`ContextManager`] snapshot for `id` from `dir`. A missing file
+/// (never snapshotted — older session, or brand new) or a schema mismatch
+/// is `Err`; callers fall back to the session log's record-by-record
+/// replay (or a fresh manager) in that case.
+pub fn load_in(dir: &std::path::Path, id: &str) -> Result<ContextManager, String> {
+    if !super::assessment::is_valid_id(id) {
+        return Err(format!("invalid context snapshot id: {id}"));
+    }
+    let path = dir.join(format!("{id}.context.json"));
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("open context snapshot: {e}"))?;
+    let snapshot: ContextSnapshot =
+        serde_json::from_str(&text).map_err(|e| format!("parse context snapshot: {e}"))?;
+    if snapshot.schema_version != CONTEXT_SCHEMA_VERSION {
+        return Err("stale context snapshot schema".to_string());
+    }
+    Ok(snapshot.cm)
+}
+
+/// [`save_in`] under the shared assessments directory.
+pub fn save(id: &str, cm: &ContextManager) -> Result<(), String> {
+    save_in(&super::assessment::assessments_dir(), id, cm)
+}
+
+/// [`load_in`] under the shared assessments directory.
+pub fn load(id: &str) -> Result<ContextManager, String> {
+    load_in(&super::assessment::assessments_dir(), id)
+}
+
 fn observation_line(o: &Observation) -> String {
     format!("O{}: {}", o.id, o.summary)
 }
 
 fn action_line(a: &ActionRecord) -> String {
-    format!("{} on {} via {}", a.capability, a.target, a.provider)
+    let status = if a.effective { "effective" } else { "INEFFECTIVE" };
+    if a.reason.trim().is_empty() {
+        format!("{} on {} via {} [{status}]", a.capability, a.target, a.provider)
+    } else {
+        format!(
+            "{} on {} via {} [{status}] — {}",
+            a.capability, a.target, a.provider, a.reason
+        )
+    }
 }
 
 /// Ranked-order selection under `budget` chars: keep items in the given
@@ -695,6 +1137,36 @@ mod tests {
         // rendered body), scanners get half.
         cm.add_evidence("medusa-http", "10.0.0.1", &("X".repeat(30_000)));
         assert!(cm.evidence.last().unwrap().output.len() >= 12_000);
+        // Web research (fetched source/docs) must also get the FULL cap,
+        // not half — the model needs to read it, and the line that matters
+        // can sit deep in the extract.
+        cm.add_evidence("medusa-research", "https://example.com", &("Y".repeat(30_000)));
+        let research = cm.evidence.last().unwrap();
+        assert_eq!(research.tool_id, "medusa-research");
+        assert!(
+            research.output.len() >= 12_000,
+            "research must get the full cap, got {}",
+            research.output.len()
+        );
+        // A plain scanner still gets only half.
+        cm.add_evidence("nuclei", "10.0.0.1", &("Z".repeat(30_000)));
+        assert!(cm.evidence.last().unwrap().output.len() < 12_000);
+    }
+
+    #[test]
+    fn identical_research_refetch_is_deduped() {
+        let mut cm = ContextManager::new();
+        let page = "challenge head content".repeat(50);
+        cm.add_evidence("medusa-research", "https://x/challenges.yml", &page);
+        let n = cm.evidence.len();
+        // Re-fetching the same URL with the same (windowed) content adds
+        // nothing — it must not pile up another identical entry.
+        cm.add_evidence("medusa-research", "https://x/challenges.yml", &page);
+        cm.add_evidence("medusa-research", "https://x/challenges.yml", &page);
+        assert_eq!(cm.evidence.len(), n, "identical re-fetch must be deduped");
+        // A DIFFERENT window of the same URL is new information — kept.
+        cm.add_evidence("medusa-research", "https://x/challenges.yml", "a different window");
+        assert_eq!(cm.evidence.len(), n + 1);
     }
 
     #[test]
@@ -813,8 +1285,58 @@ mod tests {
         let (view, _) = cm.build_view(&target(), 3, caps(), 0);
         assert_eq!(
             view.prior_actions,
-            vec!["network.port_scan on 10.0.0.9 via nmap".to_string()]
+            vec!["network.port_scan on 10.0.0.9 via nmap [effective] — unknown services".to_string()]
         );
+    }
+
+    #[test]
+    fn action_lines_flag_ineffective_runs() {
+        let mut cm = ContextManager::new();
+        cm.add_action(
+            1,
+            "web.sql_injection".into(),
+            "sqlmap".into(),
+            "http://x/login".into(),
+            "test login form for SQLi".into(),
+            false,
+        );
+        let (view, _) = cm.build_view(&target(), 2, caps(), 0);
+        assert_eq!(
+            view.prior_actions,
+            vec![
+                "web.sql_injection on http://x/login via sqlmap [INEFFECTIVE] — test login form for SQLi"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn error_history_accumulates_distinct_errors_and_never_clears() {
+        let mut cm = ContextManager::new();
+        cm.set_last_error(Some("first failure: connection refused".into()));
+        cm.set_last_error(None);
+        cm.set_last_error(Some("second failure: 403 forbidden".into()));
+        let (view, _) = cm.build_view(&target(), 2, caps(), 0);
+        assert_eq!(view.last_error.as_deref(), Some("second failure: 403 forbidden"));
+        assert_eq!(
+            view.recent_errors,
+            vec![
+                "first failure: connection refused".to_string(),
+                "second failure: 403 forbidden".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn error_history_dedupes_immediate_repeats_and_is_bounded() {
+        let mut cm = ContextManager::new();
+        for i in 0..10 {
+            cm.set_last_error(Some(format!("error {i}")));
+        }
+        cm.set_last_error(Some("error 9".into()));
+        let (view, _) = cm.build_view(&target(), 10, caps(), 0);
+        assert!(view.recent_errors.len() <= 6, "must stay bounded: {:?}", view.recent_errors);
+        assert_eq!(view.recent_errors.last().unwrap(), "error 9");
     }
 
     #[test]
@@ -847,6 +1369,63 @@ mod tests {
         assert_eq!(view.findings.len(), 1);
         assert!(view.findings[0].contains("F1"));
         assert!(view.context_note.is_none());
+    }
+
+    #[test]
+    fn pending_narration_fires_on_new_finding_and_clears_on_narrate() {
+        let mut cm = ContextManager::new();
+        // Nothing found yet: no nudge.
+        let (view, _) = cm.build_view(&target(), 1, caps(), 0);
+        assert!(view.pending_narration.is_none());
+
+        // A finding is recorded but not announced: the harness demands it.
+        cm.add_finding("High", "SQLi in login", "10.0.0.1", "web.scan", "error-based", 2);
+        let (view, _) = cm.build_view(&target(), 3, caps(), 0);
+        let note = view.pending_narration.expect("must nudge for unnarrated finding");
+        assert!(note.contains("F1"));
+        assert!(note.contains("SQLi in login"));
+
+        // The model narrates: the backlog clears.
+        cm.add_narration("Confirmed SQL injection in the login form.");
+        let (view, _) = cm.build_view(&target(), 4, caps(), 0);
+        assert!(
+            view.pending_narration.is_none(),
+            "narrating must clear the pending-narration nudge"
+        );
+
+        // A second, later finding re-arms the nudge for that one only.
+        cm.add_finding("Critical", "RCE via upload", "10.0.0.1", "web.scan", "shell", 5);
+        let (view, _) = cm.build_view(&target(), 6, caps(), 0);
+        let note = view.pending_narration.expect("new finding must re-arm the nudge");
+        assert!(note.contains("RCE via upload"));
+        assert!(!note.contains("SQLi in login"), "already-narrated finding must not reappear");
+    }
+
+    #[test]
+    fn strategy_hint_fires_after_actions_without_a_finding_and_resets_on_one() {
+        let mut cm = ContextManager::new();
+        // A few actions, no finding yet: below threshold, no hint.
+        for i in 0..4 {
+            cm.add_action(i, "http.request".into(), "medusa-http".into(), "t".into(), "probe".into(), true);
+        }
+        let (view, _) = cm.build_view(&target(), 4, caps(), 0);
+        assert!(view.strategy_hint.is_none());
+
+        // Cross the threshold with no finding: the harness warns of thrashing.
+        for i in 4..9 {
+            cm.add_action(i, "http.request".into(), "medusa-http".into(), "t".into(), "probe".into(), true);
+        }
+        let (view, _) = cm.build_view(&target(), 9, caps(), 0);
+        let hint = view.strategy_hint.expect("stall must raise a strategy hint");
+        assert!(hint.contains("web.research"), "hint should point at reading source: {hint}");
+
+        // A new finding resets the counter — progress clears the hint.
+        cm.add_finding("High", "open redirect", "t", "http.request", "d", 9);
+        let (view, _) = cm.build_view(&target(), 10, caps(), 0);
+        assert!(
+            view.strategy_hint.is_none(),
+            "a new finding must clear the thrashing hint"
+        );
     }
 
     #[test]
@@ -909,6 +1488,123 @@ mod tests {
     }
 
     #[test]
+    fn transcript_records_turns_and_steps_append_only() {
+        let mut cm = ContextManager::new();
+        cm.begin_turn("assess 10.0.0.1");
+        cm.add_observation("10.0.0.1", "port 80 open", "nmap", 0);
+        cm.add_evidence("nmap", "10.0.0.1", "PORT 80/tcp open");
+        cm.push_assistant("{\"decision\":\"execute\"}".into());
+        cm.add_narration("found a web server");
+        let roles: Vec<&str> = cm
+            .transcript()
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
+        assert_eq!(roles, vec!["user", "user", "user", "assistant", "assistant"]);
+        assert_eq!(cm.transcript()[0].content, "assess 10.0.0.1");
+        // Empty pushes are ignored — no blank messages on the wire.
+        cm.push_user("   ".into());
+        cm.push_assistant(String::new());
+        assert_eq!(cm.transcript().len(), 5);
+        // Later views extend the transcript; earlier messages never change.
+        let (v1, _) = cm.build_view(&target(), 1, caps(), 0);
+        cm.add_observation("10.0.0.1", "port 443 open", "nmap", 1);
+        let (v2, _) = cm.build_view(&target(), 2, caps(), 0);
+        assert!(v2.transcript.starts_with(&v1.transcript));
+        assert_eq!(v2.transcript.len(), v1.transcript.len() + 1);
+    }
+
+    #[test]
+    fn transcript_dedups_repeated_observations() {
+        let mut cm = ContextManager::new();
+        cm.add_observation("t", "same summary", "s", 0);
+        cm.add_observation("t", "same summary", "s", 1);
+        assert_eq!(cm.transcript().len(), 1);
+        // Empty evidence is skipped everywhere, transcript included.
+        cm.add_evidence("nmap", "t", "");
+        assert_eq!(cm.transcript().len(), 1);
+    }
+
+    #[test]
+    fn staged_model_note_hidden_same_step_shown_next() {
+        let mut cm = ContextManager::new();
+        cm.begin_turn("go");
+        cm.stage_model_note("model call failed (boom) — retried 1/5".into(), 3);
+        // Same-step retry rebuild: no note → byte-identical request.
+        let (retry_view, _) = cm.build_view(&target(), 3, caps(), 0);
+        assert!(
+            !retry_view.tail.contains("MODEL NOTE"),
+            "tail was: {}",
+            retry_view.tail
+        );
+        // Next step: the note surfaces in the tail.
+        let (next_view, _) = cm.build_view(&target(), 4, caps(), 0);
+        assert!(
+            next_view.tail.contains("MODEL NOTE: model call failed (boom)"),
+            "tail was: {}",
+            next_view.tail
+        );
+        // Clearing drops it again.
+        cm.clear_staged_model_note();
+        let (cleared, _) = cm.build_view(&target(), 5, caps(), 0);
+        assert!(!cleared.tail.contains("MODEL NOTE"));
+    }
+
+    #[test]
+    fn compact_rewrites_transcript_boundary() {
+        let mut cm = ContextManager::new();
+        for i in 0..4 {
+            cm.begin_turn(&format!("user {i}"));
+            cm.push_assistant(format!("{{\"decision\":\"finish\",\"reason\":\"{i}\"}}"));
+            cm.add_observation("t", &format!("obs {i}"), "s", i);
+        }
+        cm.stage_model_note("stale note".into(), 3);
+        cm.compact("summary of four turns", 2);
+        // Summary exchange first, then the most recent messages verbatim.
+        assert_eq!(cm.transcript()[0].role, "user");
+        assert_eq!(cm.transcript()[1].content, "summary of four turns");
+        assert!(cm.transcript().len() > 2);
+        // A staged note must not survive the boundary.
+        let (view, _) = cm.build_view(&target(), 4, caps(), 0);
+        assert!(!view.tail.contains("stale note"), "tail was: {}", view.tail);
+        assert!(view.tail.contains("STEP: 4"));
+    }
+
+    #[test]
+    fn transcript_survives_snapshot_round_trip() {
+        let mut cm = ContextManager::new();
+        cm.begin_turn("assess 10.0.0.1");
+        cm.add_observation("10.0.0.1", "port 80 open", "nmap", 0);
+        cm.push_assistant("{\"decision\":\"finish\"}".into());
+        let dir = std::env::temp_dir().join(format!(
+            "medusa-transcript-rt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        save_in(&dir, "testsession1", &cm).unwrap();
+        let loaded = load_in(&dir, "testsession1").unwrap();
+        assert_eq!(loaded.transcript(), cm.transcript());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn brief_head_stable_when_findings_grow() {
+        let mut cm = ContextManager::new();
+        cm.set_vault_keys(vec!["db_password [password]".into()]);
+        let (v1, _) = cm.build_view(&target(), 0, caps(), 0);
+        cm.add_finding("High", "SQLi", "10.0.0.1", "web.scan", "detail", 1);
+        let (v2, _) = cm.build_view(&target(), 1, caps(), 0);
+        // Everything before the findings section is byte-identical: a new
+        // finding only extends the brief's end (cache-safe growth).
+        let head_end = |b: &str| b.find("FINDINGS").unwrap_or(b.len());
+        assert_eq!(&v1.brief[..head_end(&v1.brief)], &v2.brief[..head_end(&v2.brief)]);
+        assert!(v2.brief.contains("SQLi"));
+        // The tail always carries the step (volatile by design).
+        assert!(v1.tail.contains("STEP: 0"));
+        assert!(v2.tail.contains("STEP: 1"));
+    }
+
+    #[test]
     fn vault_values_ride_one_view() {
         let mut cm = ContextManager::new();
         cm.recall_vault_value("db_password", "s3cr3t");
@@ -917,5 +1613,70 @@ mod tests {
         cm.clear_vault_values();
         let (view, _) = cm.build_view(&target(), 0, caps(), 0);
         assert!(view.vault_values.is_empty());
+    }
+
+    fn snapshot_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("medusa-context-snapshot-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn snapshot_round_trips_actions_evidence_and_errors() {
+        let dir = snapshot_temp_dir("roundtrip");
+        let mut cm = ContextManager::new();
+        cm.add_action(
+            1,
+            "network.port_scan".into(),
+            "nmap".into(),
+            "10.0.0.1".into(),
+            "map services".into(),
+            true,
+        );
+        cm.add_evidence("nmap", "10.0.0.1", "22/tcp open ssh");
+        cm.set_last_error(Some("connection refused".into()));
+        cm.set_last_error(None);
+        cm.add_finding("High", "SQLi", "10.0.0.1", "web.scan", "d", 1);
+        cm.add_narration("told the user about SQLi");
+        cm.begin_turn("scan it");
+        cm.end_turn("working on it");
+        save_in(&dir, "a1", &cm).unwrap();
+        let restored = load_in(&dir, "a1").unwrap();
+        let (view, _) = restored.build_view(&target(), 2, caps(), 0);
+        assert_eq!(view.prior_actions.len(), 1);
+        assert!(view.prior_actions[0].contains("[effective]"));
+        assert_eq!(view.recent_evidence.len(), 1);
+        assert_eq!(view.recent_errors, vec!["connection refused".to_string()]);
+        assert_eq!(view.findings.len(), 1);
+        assert_eq!(view.narrations.len(), 1);
+        assert_eq!(view.conversation.len(), 1);
+        assert!(view.conversation[0].assistant.contains("working on it"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_never_persists_vault_values() {
+        let dir = snapshot_temp_dir("vault");
+        let mut cm = ContextManager::new();
+        cm.set_vault_keys(vec!["db_password [password]".into()]);
+        cm.recall_vault_value("db_password", "s3cr3t-value");
+        save_in(&dir, "a2", &cm).unwrap();
+        let text = std::fs::read_to_string(dir.join("a2.context.json")).unwrap();
+        assert!(!text.contains("s3cr3t-value"), "vault value leaked into snapshot: {text}");
+        let restored = load_in(&dir, "a2").unwrap();
+        let (view, _) = restored.build_view(&target(), 0, caps(), 0);
+        assert!(view.vault_keys.is_empty());
+        assert!(view.vault_values.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_load_rejects_missing_and_invalid_ids() {
+        let dir = snapshot_temp_dir("missing");
+        assert!(load_in(&dir, "never-saved").is_err());
+        assert!(load_in(&dir, "../evil").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

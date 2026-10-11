@@ -1134,7 +1134,19 @@ The only goal of this phase is to build a robust, extensible **Security Tool + C
 
 # Phase 1+: The Agentic Part â€” One Generic Investigation Loop
 
-Status:
+Status (historical â€” see correction note below):
+> CORRECTION: the Phase 3/5/6/7/8 lines below describe `src/agent/world.rs`,
+> `src/agent/hypothesis.rs`, `src/registry/security_tests.rs`, and
+> `src/agent/planner.rs`, which do NOT exist in the tree. The authoritative
+> state plane is now: `src/agent/assessment.rs` (AssessmentState root + JSON
+> snapshots), `target_model.rs`, `evidence.rs`, `attack_graph.rs`,
+> `findings.rs`, `investigation.rs`, `families.rs` (full 16-family taxonomy +
+> `infer_family`), `security_tests.rs`, `completeness.rs` (Finish gating),
+> `planner.rs` (minimal advisory). `ContextManager` is a projection layer
+> only. `ReportFinding`/`UpdateFinding` mirror into `FindingStore`; snapshots
+> auto-save per step and reload via `AgentRuntime::resume_session`. UI panels
+> (`/assess` summary, `/status`, TUI `InvestigationDone`) render from runtime
+> state. Original (stale) phase notes preserved below for history.
 - Phase 0 complete and verified: 30 tools, 61 capabilities, 8 profiles, doctor, deterministic CLI.
 - Phase 1 complete: `src/agent/` â€” AgentRuntime, ModelProvider (stub + OpenAI-compatible), Decision, ExecutionPolicy, loop, cancellation. 36+ tests.
 - Phase 1.5 complete: `AgentEvent` stream (`src/agent/events.rs`); runtime emits via `investigate_with(&mut FnMut)`; headless `investigate()` unchanged.
@@ -1317,15 +1329,15 @@ No keys in code or config files. A stub/deterministic provider exists for tests 
 
 ## Guiding principle
 
-Don't build 15 security agents. Build **one investigation engine + many security capabilities/tests** â€” moving Medusa from "run all scanners and summarize" to "understand the target, model the attack surface, identify unknowns, choose targeted tests, correlate evidence, validate hypotheses, produce defensible findings."
+Don't build 15 security agents. Build **one investigation engine + many security capabilities/tests** â€” moving Cipher from "run all scanners and summarize" to "understand the target, model the attack surface, identify unknowns, choose targeted tests, correlate evidence, validate hypotheses, produce defensible findings."
 
 No further tool-list expansion before the core loop exists (per reviewer; Phase 0 registry is sufficient foundation).
 
-## TUI UX pass 3 — opencode parity + research round
+## TUI UX pass 3 ï¿½ opencode parity + research round
 
 Research (opencode Go/bubbletea source, Pi harness, Anthropic compaction + context-window docs, Codex CLI architecture):
 - opencode keybinds (source of truth): `history_previous: up`, `history_next: down`, `messages_page_up: pageup`, `input_move_up/down: up/down`; home screen = vertically-centered logo + Prompt with rotating placeholders + bottom footer; DialogAlert for errors; prompt history in JSONL (cap 50, dedupe, self-heal).
-- Pi (earendil): minimal harness; AGENTS.md instructions; extensions inject/filter history per turn; context_checkpoint/timeline/compact tools; footer shows context usage/tokens; transient errors retried =5×.
+- Pi (earendil): minimal harness; AGENTS.md instructions; extensions inject/filter history per turn; context_checkpoint/timeline/compact tools; footer shows context usage/tokens; transient errors retried =5ï¿½.
 - Claude Code: full-history accumulation with server-side compaction at ~83.5% (summary replaces old context, skills re-injected capped); /compact manual; subagents get fresh windows.
 - Codex: turn-based loop over Responses API; transcript persisted + resume; subagents own context; hierarchical AGENTS.md kept under ~150 lines; thin ratatui TUI client; "100% context left" header meter.
 
@@ -1335,4 +1347,4 @@ Fixes applied:
 - Keybinds: ?/? prompt history (browse-aware), PgUp/PgDn transcript browser, Ctrl+P/N retained.
 - Prompt history persists to `%APPDATA%\medusa\prompt-history.jsonl` (cap 50, dedupe, load at startup).
 - 138 unit + 3 integration tests pass, zero warnings.
-- Startup panic fix: `landing_lines` emitted 5 rows (extra blank + 4-row logo) vs `LANDING_LINES=4` geometry — dropped the duplicate blank, added `landing_height_matches_geometry_constant` regression test. 139 unit + 3 integration, zero warnings.
+- Startup panic fix: `landing_lines` emitted 5 rows (extra blank + 4-row logo) vs `LANDING_LINES=4` geometry ï¿½ dropped the duplicate blank, added `landing_height_matches_geometry_constant` regression test. 139 unit + 3 integration, zero warnings.

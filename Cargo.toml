@@ -23,6 +23,12 @@ serde_json = "1"
 # surfaces as `os error 10060` (connect timeout) while curl/other agents
 # succeed.
 ureq = { version = "2", default-features = false, features = ["tls", "json", "socks-proxy"] }
+# Pooled keep-alive HTTP client for the OpenAI-compatible ModelProvider:
+# one Client per provider instance, reused across all its calls (keep-alive
+# + HTTP/2 auto-negotiation), SSE streaming, per-read idle timeouts.
+# rustls + webpki roots matches the ureq `tls` setup used elsewhere;
+# `socks` keeps SOCKS5 proxy parity.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls-webpki-roots", "socks"] }
 # Phase 1.6 rich inline CLI (libraries, not hand-rolled escape codes).
 console = "0.15"
 indicatif = "0.17"

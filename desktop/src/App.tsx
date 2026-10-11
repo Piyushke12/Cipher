@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import avatarUrl from "./assets/avatar.png";
@@ -15,8 +17,18 @@ type ToolInfo = {
 type CapInfo = { id: string; description: string; importance: string; providers: string[]; available: boolean };
 type ProvInfo = { id: string; tag: string; model: string; ready: boolean; active: boolean };
 type DoctorInfo = { platform: string; tools_installed: number; tools_total: number; caps_covered: number; caps_total: number; issues: string[] };
-type AgentEvt = { type: string; payload: string; summary: string; session?: string; capability?: string | null; target?: string | null; output?: string | null; model_secs?: number | null; tool_secs?: number | null; ctx?: { used: number; limit: number; pct: number; estimated: boolean } | null; finding?: { id: number; severity: string; title: string; target: string; status: string; detail: string } | null; compact?: { before: number; after: number; freed: number; fallback: boolean } | null; vault_key?: { op: string; key: string; kind?: string; refreshed?: boolean } | null };
+type AgentEvt = { type: string; payload: string; summary: string; session?: string; capability?: string | null; target?: string | null; output?: string | null; model_secs?: number | null; tool_secs?: number | null; ctx?: { used: number; limit: number; pct: number; estimated: boolean; cached?: number } | null; finding?: { id: number; severity: string; title: string; target: string; status: string; detail: string } | null; compact?: { before: number; after: number; freed: number; fallback: boolean } | null; vault_key?: { op: string; key: string; kind?: string; refreshed?: boolean } | null };
 type SessionSummary = { id: string; title: string; target: string | null; time_created: number; time_updated: number; records: number };
+/** One debug-trace line. Mirrors medusa_lib::infra::trace::TraceEntry —
+ *  tags are CAPITAL AREA.EVENT strings; secrets are redacted server-side. */
+type TraceEntry = { ts: number; step: number; assessment: string; tag: string; msg: string; data: unknown };
+type TraceTail = { entries: TraceEntry[]; total: number; truncated: boolean };
+/** Tags that mean something failed (for the drawer's Failures filter). */
+const TRACE_FAILURE_TAGS = new Set([
+  "LLM.RETRY", "LLM.GAVE_UP", "LLM.MISCONFIGURED", "LLM.BAD_RESPONSE",
+  "POLICY.REJECTED", "PROVIDER.REJECTED", "BREAKER.BLOCKED", "BREAKER.STUCK",
+  "HARNESS.FEEDBACK", "TOOL.INEFFECTIVE",
+]);
 /** One persisted JSONL line from the backend session store. Mirrors
  *  medusa_lib::infra::sessions::SessionRecord (snake_case `type` tags). */
 type TimedRec =
@@ -47,6 +59,7 @@ const ICON: Record<string, string> = {
   x: "M6 6l12 12M18 6L6 18",
   up: "M12 19V5M6 11l6-6 6 6",
   copy: "M9 9h10v11H9zM5 15V4h10",
+  edit: "M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z",
   book: "M5 4h10a3 3 0 0 1 3 3v13H8a3 3 0 0 1-3-3zM5 17a3 3 0 0 1 3-3h10",
   refresh: "M20 11a8 8 0 0 0-14.5-3.5M4 5v4h4M4 13a8 8 0 0 0 14.5 3.5M20 19v-4h-4",
   right: "M9 6l6 6-6 6",
@@ -74,10 +87,38 @@ function Ic({ n, s = 18 }: { n: string; s?: number }) {
 function Logo({ z = 46 }: { z?: number }) {
   return <img className="logo-img" src={avatarUrl} width={z} height={z} alt="" aria-hidden="true" />;
 }
+/** Flattens a rendered React tree back to plain text, so the copy button
+ *  on a code block grabs the real code even after rehype-highlight has
+ *  wrapped tokens in nested <span> elements. */
+function textOf(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (typeof node === "object" && "props" in node) return textOf((node as { props: { children?: ReactNode } }).props.children);
+  return "";
+}
+/** Fenced code block: language chip + copy button above the highlighted body.
+ *  Only wraps blocks that carry a `language-xxx` class (from a fenced code
+ *  span); indented/plain blocks fall back to the plain `<pre>`, and inline
+ *  `code` spans are untouched since rehype-highlight only tags block code. */
+function CodePre(props: { children?: ReactNode }) {
+  const child = Array.isArray(props.children) ? props.children[0] : props.children;
+  const codeProps = (child != null && typeof child === "object" && "props" in child)
+    ? (child as { props: { className?: string; children?: ReactNode } }).props : undefined;
+  const m = /language-(\S+)/.exec(codeProps?.className ?? "");
+  if (!m) return <pre>{props.children}</pre>;
+  const code = textOf(codeProps?.children).replace(/\n$/, "");
+  return (
+    <div className="codeblock">
+      <div className="codeblock-hd"><span>{m[1]}</span><CopyBtn title="Copy code" text={code} /></div>
+      <pre>{props.children}</pre>
+    </div>
+  );
+}
 function Markdown({ text }: { text: string }) {
   return (
     <div className="md">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]} components={{ pre: CodePre }}>{text}</ReactMarkdown>
     </div>
   );
 }
@@ -128,10 +169,10 @@ type View = "session" | "tools" | "coverage" | "doctor";
 type Step = { cap: string; target: string; reason: string; provider: string; result: string; outputs: string[]; raw?: string; at: number; dur?: number; toolSecs?: number; state: "run" | "done" | "wait"; open: boolean };
 type Finding = { sev: string; title: string; host: string; cap: string; id?: number; status?: string; detail?: string };
 /** Live context-meter reading from the backend's ContextUsage events. */
-type CtxState = { used: number; limit: number; pct: number; estimated: boolean };
+type CtxState = { used: number; limit: number; pct: number; estimated: boolean; /** prefix-cache hits, 0 when the endpoint doesn't report */ cached?: number };
 /** Vault KEY NAMES only — values never leave the backend. */
 type VaultKey = { key: string; kind: string };
-type ChatMsg = { user: string; agent: string; pending?: boolean; at: number; agentAt?: number };
+  type ChatMsg = { user: string; agent: string; pending?: boolean; /** sent while a turn was running and not yet picked up by the worker */ queued?: boolean; at: number; agentAt?: number };
 type Approval = { title: string; message: string; options: string[]; selected: number; chatTarget: string | null };
 /** One entry in the chat stream — a user message, a model reply, a
  *  thinking snippet, or a tool-call card. Each carries `at` (ms epoch) so
@@ -146,6 +187,13 @@ function fmtT(ts: number) {
   const d = new Date(ts);
   const p = (n: number) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Key for the per-session composer draft map — `null` is the not-yet-
+ *  created "new session" slot, so an unsent draft there survives
+ *  switching away to look at another session and back. */
+function draftKey(id: string | null): string {
+  return id ?? "__new__";
 }
 
 /** "Oct 2 14:32" label for the saved-session list. */
@@ -211,6 +259,12 @@ export default function App() {
   // previous transition-guard design could stick across a silently
   // cancelled turn and never re-stamp again.
   const [thinkingSince, setThinkingSince] = useState<number>(Date.now());
+  // True while one model-decision is in flight for the CURRENT step —
+  // including its retries. Set on the step's first ModelThinking, cleared
+  // when a decision/tool/terminal event lands. Retry re-emits of
+  // ModelThinking check this so the live "waiting …" timer keeps counting
+  // the real cumulative wait instead of resetting to 0 on every retry.
+  const inModelWaitRef = useRef(false);
   // Latency note shown BESIDE the dots while waiting on the model (e.g.
   // "model call failed — retrying 2/5"). Lives separately from `status`
   // so ModelThinking re-emits (retry loop) don't wipe it.
@@ -223,13 +277,40 @@ export default function App() {
   const [chat, setChat] = useState<ChatMsg[]>([]);
   const [stream, setStream] = useState<AgentMsg[]>([]);
   const [input, setInput] = useState("");
+  // Unsent composer text, kept per session so switching sessions (or
+  // leaving and coming back to the empty "new session" slot) restores
+  // whatever was being typed instead of losing it. Text only — never
+  // sent to the backend, never part of the transcript.
+  const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem("medusa-drafts") || "{}"); } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("medusa-drafts", JSON.stringify(drafts)); } catch { /* storage unavailable */ }
+  }, [drafts]);
   const [slash, setSlash] = useState(false);
   const [approval, setApproval] = useState<Approval | null>(null);
   const [customAns, setCustomAns] = useState("");
   // first run + toast
   const [sheet, setSheet] = useState(false);
   const [toast, setToast] = useState("");
+  // Trace drawer (per-session debug log, behind a button).
+  const [traceOpen, setTraceOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  // Drop composer drafts for sessions that no longer exist (deleted, or
+  // never actually persisted past the "new session" slot) once the
+  // sidebar list refreshes.
+  useEffect(() => {
+    const live = new Set(sessions.map((s) => s.id));
+    live.add(draftKey(null));
+    setDrafts((d) => {
+      const kept = Object.fromEntries(Object.entries(d).filter(([k]) => live.has(k)));
+      return Object.keys(kept).length === Object.keys(d).length ? d : kept;
+    });
+  }, [sessions]);
+  // Sidebar rename: id of the row under edit, plus its draft text — null
+  // when no row is being renamed.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameVal, setRenameVal] = useState("");
   const [curSession, setCurSession] = useState<string | null>(null);
   // Mirror of curSession for the event listener (stable closure): the
   // backend tags every event with its session id; we only render the
@@ -296,10 +377,19 @@ export default function App() {
       // Actor-per-session: render only the session we are looking at.
       // Background sessions persist server-side; switching replays them.
       if (p.session && curSessionRef.current && p.session !== curSessionRef.current) return;
-      // Any event other than a model-wait marker or a status note ends
-      // the "thinking" animation and clears the wait note (a decision
-      // landed, a tool is running).
-      if (p.type !== "ModelThinking" && p.type !== "Status") { setThinking(false); setWaitNote(null); }
+      // A decision/tool/terminal event ends the "thinking" animation and
+      // the model wait. ContextUsage and StepStarted are EXCLUDED: they fire
+      // between a failed model call and its retry, so treating them as "wait
+      // over" would stop (and later reset) the live timer on every retry.
+      // Keeping them in the wait lets the timer show the true cumulative
+      // per-step wait across all retries.
+      const KEEPS_WAIT = ["ModelThinking", "Status", "UserMessageSeen", "ContextUsage", "StepStarted"];
+      if (!KEEPS_WAIT.includes(p.type)) { setThinking(false); setWaitNote(null); inModelWaitRef.current = false; }
+      // A mid-turn message the backend just folded into the running turn.
+      // The user bubble is already shown optimistically on send, so there
+      // is nothing to render — and the turn keeps going, so leave the
+      // thinking state alone.
+      if (p.type === "UserMessageSeen") return;
       if (p.type === "Reply") {
         // The agent's conversational answer ends the turn: fill the
         // pending bubble, stop the spinner.
@@ -363,7 +453,7 @@ export default function App() {
         }
         return;
       } else if (p.type === "ContextUsage") {
-        if (p.ctx) setCtx({ used: p.ctx.used, limit: p.ctx.limit, pct: p.ctx.pct, estimated: p.ctx.estimated });
+        if (p.ctx) setCtx({ used: p.ctx.used, limit: p.ctx.limit, pct: p.ctx.pct, estimated: p.ctx.estimated, cached: p.ctx.cached ?? 0 });
         return;
       } else if (p.type === "Compacted") {
         const c = p.compact;
@@ -395,15 +485,23 @@ export default function App() {
         patchLastTool((st) => (st.state === "run" ? { ...st, state: "wait", result: "Waiting for you" } : st));
         return;
       } else if (p.type === "ModelThinking") {
-        // Model call in flight: animated dots plus a live stall timer.
-        // Stamped every arrival — the wait note (if any) persists across
-        // the retry loop's re-emits.
-        setThinkingSince(Date.now());
+        // Model call in flight: animated dots plus a live stall timer. Stamp
+        // the start ONLY on the step's first thinking — retry re-emits (the
+        // drive loop re-enters the top of the loop on each retry) must NOT
+        // reset the clock, or the timer never shows the real cumulative wait.
+        if (!inModelWaitRef.current) { setThinkingSince(Date.now()); inModelWaitRef.current = true; }
         setThinking(true);
         return;
       } else if (p.type === "Status") {
         // Retry/latency note during model waits.
-        setWaitNote(p.summary || "");
+        const msg = p.summary || "";
+        setWaitNote(msg);
+        // Persist a model-call retry (with its error) as its own entry so the
+        // whole retry sequence stays visible in the transcript — not just the
+        // latest transient note that the next retry overwrites.
+        if (/retry|retrying/i.test(msg)) {
+          setStream((s) => [...s, { kind: "note", text: msg, at: Date.now() }]);
+        }
         return;
       } else if (p.type === "InvestigationStarted" || p.type === "StepStarted" || p.type === "ToolStarted" || p.type === "ToolFinished") {
         setStatus(p.summary || "");
@@ -433,6 +531,34 @@ export default function App() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [stream, findings, chat, status]);
 
+  // grow the composer with its content (up to the CSS max-height, which
+  // then scrolls) instead of staying pinned to a single visible line
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
+  // Clear "queued" flags once the worker has picked the messages up.
+  // `queue_depth` counts sent-but-unpopped mailbox messages; when it hits
+  // zero every queued bubble has at least been seen (it may still be
+  // pending while its turn runs).
+  useEffect(() => {
+    if (!chat.some((m) => m.queued)) return;
+    let dead = false;
+    const id = window.setInterval(async () => {
+      try {
+        const depth = await invoke<number>("queue_depth", {});
+        if (dead) return;
+        if (depth === 0) {
+          setChat((c) => (c.some((m) => m.queued) ? c.map((m) => (m.queued ? { ...m, queued: false } : m)) : c));
+        }
+      } catch { /* backend unavailable in preview */ }
+    }, 1500);
+    return () => { dead = true; window.clearInterval(id); };
+  }, [chat]);
+
   // Auto-focus the composer: on opening the session view and whenever an
   // overlay (approval, first-run sheet, drawer) closes.
   useEffect(() => {
@@ -459,7 +585,7 @@ export default function App() {
   function denyApproval() {
     approveBackend(false);
     setApproval(null);
-    showToast("Denied. Medusa will note the gap in the report.");
+    showToast("Denied. Cipher will note the gap in the report.");
   }
   async function chooseApproval(idx: number) {
     if (!approval) return;
@@ -566,9 +692,16 @@ export default function App() {
       setDoneAt(data.running ? null : (lastToolDoneAt ?? lastAt));
       setTarget(tgt || "");
       setCur(id);
+      // Restore whatever was left unsent in this session's composer —
+      // the draft map is kept live (see the textarea's onChange), so
+      // this is just picking it back up.
+      setInput(drafts[draftKey(id)] ?? "");
+      setSlash(false);
       // A background worker may still be mid-turn: restore the running
       // state so live events keep streaming and the composer shows it.
       setBusy(data.running); setStatus(data.running ? "Working…" : "");
+      // Fresh view: don't inherit a stale model-wait from the last session.
+      setThinking(false); inModelWaitRef.current = false; setWaitNote(null);
       setPhase(data.running ? "run" : stream.length || chat.length ? "done" : "idle");
       setView("session");
     } catch (e) { showToast(String(e)); }
@@ -581,6 +714,7 @@ export default function App() {
     try { await invoke("close_session"); } catch { /* backend unavailable in preview */ }
     setCur(null);
     setTarget(""); setFindings([]); setDoneAt(null); setPhase("idle"); setBusy(false); setStatus("");
+    setThinking(false); inModelWaitRef.current = false; setWaitNote(null);
     setProviders([]); setObsCount(0); setChat([]); setStream([]); setApproval(null);
     setCtx(null); setVaultKeys([]);
     setInput(""); setSlash(false); setView("session");
@@ -596,6 +730,7 @@ export default function App() {
   function stopRun() {
     invoke("cancel_assess").catch(() => {});
     setThinking(false);
+    inModelWaitRef.current = false;
     setWaitNote(null);
     setBusy(false);
     setStatus("");
@@ -635,9 +770,14 @@ export default function App() {
     // Show the user's message immediately; the Reply event fills it in.
     // A fresh turn starts with clean wait state — its first ModelThinking
     // stamps the stall timer.
-    setChat((c) => [...c, { user: text, agent: "", pending: true, at: Date.now() }]);
+    // If a turn is already running, this message queues behind it in the
+    // worker mailbox: mark it queued so the bubble honestly says Cipher
+    // hasn't seen it yet (cleared by the queue poll below once picked up).
+    const sentWhileBusy = busy;
+    setChat((c) => [...c, { user: text, agent: "", pending: true, queued: sentWhileBusy, at: Date.now() }]);
     setBusy(true);
     setThinking(false);
+    inModelWaitRef.current = false;
     setWaitNote(null);
     try {
       const sid = await invoke<string>("send_message", { message: text });
@@ -738,9 +878,9 @@ export default function App() {
         className={`hh-toggle${showDurations ? " on" : ""}`}
         onClick={() => setShowDurations((v) => { localStorage.setItem("medusa-durations", v ? "0" : "1"); return !v; })}
         title="Show per-step durations (LLM vs tool) on tool cards"
-      ><Ic n="clock" s={13} />Timings</button><button className="btn sm" onClick={() => showToast("Report export opens here")}><Ic n="file" s={14} />Export report</button>{busy && <button className="btn sm" onClick={async () => { try { await invoke("cancel_assess"); } catch { /* ignore */ } setBusy(false); }}>Cancel</button>}</>)],
+      ><Ic n="clock" s={13} />Timings</button><button className="btn sm" onClick={() => showToast("Report export opens here")}><Ic n="file" s={14} />Export report</button><button className="btn sm" onClick={() => setTraceOpen(true)} title="Per-session debug trace: every LLM call, tool invocation and harness reply"><Ic n="pulse" s={13} />Trace</button>{busy && <button className="btn sm" onClick={async () => { try { await invoke("cancel_assess"); } catch { /* ignore */ } setBusy(false); }}>Cancel</button>}</>)],
     tools: [`Tools`, `${installed.length} ready on this machine`, (<button className="btn" onClick={doRefresh}><Ic n="refresh" s={15} />Refresh tools</button>)],
-    coverage: [`Coverage`, `What Medusa can and can’t assess on this machine`, (<></>)],
+    coverage: [`Coverage`, `What Cipher can and can’t assess on this machine`, (<></>)],
     doctor: [`Doctor`, `Why a tool or capability works, or doesn’t`, (<button className="btn" onClick={doRefresh}><Ic n="refresh" s={15} />Run again</button>)],
   };
   // Single-view nav: the tool/coverage/doctor views stay reachable via
@@ -758,27 +898,69 @@ export default function App() {
   /** Session rows, rendered in the left sidebar (the single home for
    *  the session list since the right panel no longer carries it). */
   function sessionRows() {
-    return sessions.map((s) => (
-      <div
-        key={s.id}
-        className={`hrow${s.id === curSession ? " on" : ""}`}
-        role="button"
-        tabIndex={0}
-        aria-current={s.id === curSession ? "true" : undefined}
-        onClick={() => { if (s.id !== curSession) openSession(s.id); }}
-        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); if (s.id !== curSession) openSession(s.id); } }}
-      >
-        <span className="dot" aria-hidden="true" />
-        <span>
-          <b>{s.title}</b>
-          <small>{[s.target, fmtDay(s.time_updated), s.records ? `${s.records} events` : null].filter(Boolean).join(" · ")}</small>
-        </span>
-        <button className="hdel" title={`Delete "${s.title}"`} aria-label={`Delete session ${s.title}`}
-          onClick={(e) => { e.stopPropagation(); delSession(s.id); }}>
-          <Ic n="x" s={13} />
-        </button>
-      </div>
-    ));
+    return sessions.map((s) => {
+      const editing = renamingId === s.id;
+      return (
+        <div
+          key={s.id}
+          className={`hrow${s.id === curSession ? " on" : ""}`}
+          role="button"
+          tabIndex={0}
+          aria-current={s.id === curSession ? "true" : undefined}
+          onClick={() => { if (!editing && s.id !== curSession) openSession(s.id); }}
+          onKeyDown={(e) => { if (!editing && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); if (s.id !== curSession) openSession(s.id); } }}
+        >
+          <span className="dot" aria-hidden="true" />
+          <span>
+            {editing ? (
+              <input
+                className="hname-input"
+                autoFocus
+                maxLength={80}
+                value={renameVal}
+                aria-label="Session title"
+                onChange={(e) => setRenameVal(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onFocus={(e) => e.currentTarget.select()}
+                onBlur={() => renameSession(s.id, renameVal)}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); }
+                  if (e.key === "Escape") { e.preventDefault(); setRenameVal(s.title); setRenamingId(null); }
+                }}
+              />
+            ) : <b>{s.title}</b>}
+            <small>{[s.target, fmtDay(s.time_updated), s.records ? `${s.records} events` : null].filter(Boolean).join(" · ")}</small>
+          </span>
+          <span className="hacts">
+            <button className="hedit" title={`Rename "${s.title}"`} aria-label={`Rename session ${s.title}`}
+              onClick={(e) => { e.stopPropagation(); setRenameVal(s.title); setRenamingId(s.id); }}>
+              <Ic n="edit" s={12} />
+            </button>
+            <button className="hdel" title={`Delete "${s.title}"`} aria-label={`Delete session ${s.title}`}
+              onClick={(e) => { e.stopPropagation(); delSession(s.id); }}>
+              <Ic n="x" s={13} />
+            </button>
+          </span>
+        </div>
+      );
+    });
+  }
+
+  /** Commit a sidebar rename. Empty/unchanged drafts are discarded
+   *  without a round-trip; the backend also rejects empty titles. */
+  async function renameSession(id: string, title: string) {
+    const next = title.trim();
+    setRenamingId(null);
+    const prev = sessions.find((s) => s.id === id)?.title;
+    if (!next || next === prev) return;
+    setSessions((ss) => ss.map((s) => (s.id === id ? { ...s, title: next } : s)));
+    try {
+      await invoke("rename_session", { id, title: next });
+    } catch (e) {
+      showToast(String(e));
+      if (prev != null) setSessions((ss) => ss.map((s) => (s.id === id ? { ...s, title: prev } : s)));
+    }
   }
 
   /** Delete a session transcript permanently (backend drops a live
@@ -795,7 +977,7 @@ export default function App() {
   return (
     <div className="app">
       <aside className="side">
-        <div className="brand"><Logo z={34} /><span>Medusa</span></div>
+        <div className="brand"><Logo z={34} /><span>Cipher</span></div>
         <nav className="nv" aria-label="Main">
           {NAV.map(([v, label, icon]) => (
             <button key={v} onClick={() => setView(v)} className={view === v ? "on" : ""} aria-current={view === v ? "page" : undefined}>
@@ -821,6 +1003,13 @@ export default function App() {
         <header className="top">
           <div className="tl">
             <div><h1>{HEAD[view][0]}</h1><p>{HEAD[view][1]}</p></div>
+            {view === "session" && curSession && (
+              <div className="sid-chip" title="Session ID — click to copy">
+                <span className="sid-label">ID</span>
+                <code>{curSession}</code>
+                <CopyBtn title="Copy session ID" text={curSession} />
+              </div>
+            )}
             <div className="acts">{HEAD[view][2]}</div>
           </div>
         </header>
@@ -834,6 +1023,7 @@ export default function App() {
 
       {sel && <><div className="scrim on" onClick={() => setSel(null)} /><Drawer id={sel} onClose={() => setSel(null)} doRefresh={doRefresh} /></>}
       {approval && <ApprovalModal approval={approval} onChoose={chooseApproval} onDeny={denyApproval} customAns={customAns} setCustomAns={setCustomAns} onSendCustom={sendCustomAnswer} />}
+      {traceOpen && curSession && <TraceDrawer sessionId={curSession} live={busy} onClose={() => setTraceOpen(false)} />}
       {sheet && <FirstRunSheet onDone={() => { localStorage.setItem("medusa-seen", "1"); setSheet(false); }} onTools={() => { localStorage.setItem("medusa-seen", "1"); setSheet(false); setView("tools"); }} />}
       {toast && <div className="toast">{toast}</div>}
     </div>
@@ -847,6 +1037,20 @@ export default function App() {
     // permanent sidebar card); the detailed list renders below at done.
     const counts = fCounts;
     const started = stream.length > 0 || phase === "run" || phase === "wait" || phase === "done";
+    /** Send whatever is in the composer and drop its now-stale draft
+     *  entry (shared by the Enter key and the send button). */
+    function sendComposer() {
+      const v = input;
+      setInput("");
+      setSlash(false);
+      setDrafts((d) => {
+        const key = draftKey(curSession);
+        if (!(key in d)) return d;
+        const { [key]: _drop, ...rest } = d;
+        return rest;
+      });
+      handleUserText(v);
+    }
     // Render chat turns and agent stream events as ONE flat, TIME-SORTED
     // sequence of `.col` flex children: user messages right, agent content
     // left with aligned avatar, every entry stamped with its clock time.
@@ -858,6 +1062,9 @@ export default function App() {
           <div className="msg-u-wrap" key={`u${ci}`}>
             <div className="msg-time">{fmtT(m.at)}</div>
             <div className="msg-u">{m.user}</div>
+            {m.pending && m.queued && (
+              <div className="msg-queued">Queued — Cipher hasn't seen this yet</div>
+            )}
           </div>
         ) });
         if (m.agent && !m.pending) {
@@ -908,7 +1115,7 @@ export default function App() {
               <div className="empty-state">
                 <Logo z={44} />
                 <h2>New session</h2>
-                <p>Ask Medusa anything, or type <code>assess scanme.nmap.org</code> to start an assessment.</p>
+                <p>Ask Cipher anything, or type <code>assess scanme.nmap.org</code> to start an assessment.</p>
               </div>
             )}
             {interleave()}
@@ -949,13 +1156,17 @@ export default function App() {
               <button className="ibtn" onClick={() => showToast("Attach a target list or scope file")} aria-label="Attach"><Ic n="clip" s={17} /></button>
               <button className="ibtn" onClick={() => showToast("Voice input is not part of this preview")} aria-label="Voice"><Ic n="mic" s={17} /></button>
               <div className="cin">
-                <textarea ref={inputRef} rows={1} value={input} placeholder="Start typing, or type / for commands" aria-label="Message Medusa"
-                  onChange={(e) => { setInput(e.target.value); setSlash(e.target.value.startsWith("/")); }}
-                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); const v = input; setInput(""); setSlash(false); handleUserText(v); } if (e.key === "Escape") setSlash(false); }} />
+                <textarea ref={inputRef} rows={1} value={input} placeholder="Start typing, or type / for commands" aria-label="Message Cipher"
+                  onChange={(e) => {
+                    setInput(e.target.value);
+                    setSlash(e.target.value.startsWith("/"));
+                    setDrafts((d) => ({ ...d, [draftKey(curSession)]: e.target.value }));
+                  }}
+                  onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendComposer(); } if (e.key === "Escape") setSlash(false); }} />
               </div>
-              <button className="go" aria-label="Send" onClick={() => { const v = input; setInput(""); setSlash(false); handleUserText(v); }}><Ic n="plane" s={19} /></button>
+              <button className="go" aria-label="Send" onClick={sendComposer}><Ic n="plane" s={19} /></button>
             </div>
-            <p className="cap">{target ? <>Scope: {target} · {PROFILES[profile].n} profile · Medusa asks before running active tests</> : <>No target yet · {PROFILES[profile].n} profile · Medusa asks before running active tests</>}{ctx ? <> · <span className={ctxClass(ctx.pct)} title={`${fmtTokens(ctx.used)} / ${fmtTokens(ctx.limit)} tokens${ctx.estimated ? " (estimated — endpoint omits usage)" : ""}`}>ctx {ctx.pct}%{ctx.estimated ? " ~" : ""}</span></> : null}{started ? <> · <button className="linklike" onClick={compactNow} title="Summarize older turns now (findings and vault keys are preserved)">compact</button></> : null}</p>
+            <p className="cap">{target ? <>Scope: {target} · {PROFILES[profile].n} profile · Cipher asks before running active tests</> : <>No target yet · {PROFILES[profile].n} profile · Cipher asks before running active tests</>}{ctx ? <> · <span className={ctxClass(ctx.pct)} title={`${fmtTokens(ctx.used)} / ${fmtTokens(ctx.limit)} tokens${ctx.estimated ? " (estimated — endpoint omits usage)" : ""}${ctx.cached ? ` · ${fmtTokens(ctx.cached)} from prefix cache (${Math.round((ctx.cached / Math.max(1, ctx.used)) * 100)}%)` : ""}`}>ctx {ctx.pct}%{ctx.estimated ? " ~" : ""}{ctx.cached ? ` · ${Math.round((ctx.cached / Math.max(1, ctx.used)) * 100)}% cached` : ""}</span></> : null}{started ? <> · <button className="linklike" onClick={compactNow} title="Summarize older turns now (findings and vault keys are preserved)">compact</button></> : null}</p>
           </div></div>
         </div>
         <aside className="hist" aria-label="Session details">
@@ -973,7 +1184,7 @@ export default function App() {
                   {fCounts.Medium > 0 && <span className="pill Medium">{fCounts.Medium} med</span>}
                   {fCounts.Low > 0 && <span className="pill Low">{fCounts.Low} low</span>}
                 </div>
-              ) : <small>No findings yet — Medusa reports them here.</small>}
+              ) : <small>No findings yet — Cipher reports them here.</small>}
             </div>
             <div className="scard">
               <div className="scard-hd"><span>Vault</span><b>{vaultKeys.length}</b></div>
@@ -1039,7 +1250,7 @@ export default function App() {
           </div>
         ))}
         {!groups.filter((g) => !cat || g.c.id === cat).length && <div className="card empty">No tools match. Clear the search or pick another category.</div>}
-        <p className="small-note">Medusa never installs tools on its own. Install a tool yourself, then refresh.</p>
+        <p className="small-note">Cipher never installs tools on its own. Install a tool yourself, then refresh.</p>
       </div>
     );
   }
@@ -1063,7 +1274,7 @@ export default function App() {
         <div className="cov-hero">
           <div className="card ringcard"><div onClick={(e) => { const g = (e.target as HTMLElement).closest("[data-dom]"); if (g) { const d = g.getAttribute("data-dom")!; setDom(dom === d ? null : d); } }} dangerouslySetInnerHTML={{ __html: ring(profile, false, false) }} /></div>
           <div className="cov-side"><div><h2>Your environment covers {Math.round(pCov * 100)}% of the {PROFILES[profile].n} profile.</h2></div>
-            <p>A tool being installed doesn&apos;t always mean a capability is covered. Medusa counts what it can actually use on this machine.</p>
+            <p>A tool being installed doesn&apos;t always mean a capability is covered. Cipher counts what it can actually use on this machine.</p>
             <div className="legend"><span><i style={{ background: "var(--accent)" }} />{n.covered} covered</span><span><i style={{ background: "var(--bronze)" }} />{n.partial} partial</span><span><i style={{ background: "var(--ink-3)" }} />{n.none} not available</span></div>
             <div><h3 style={{ marginBottom: 8 }}>Assessment profile</h3><div className="profiles">{Object.keys(PROFILES).map((k) => (<button key={k} onClick={() => { setProfile(k); setDom(null); }} className={k === profile ? "on" : ""}>{PROFILES[k].n}</button>))}</div></div>
           </div>
@@ -1122,15 +1333,15 @@ export default function App() {
     const d = doctor;
     const cards: { title: string; rows: { kind: "ok" | "warn" | "bad"; t: string; p?: string }[] }[] = [
       { title: "Platform", rows: [
-        { kind: "ok", t: d ? `${d.platform}` : "Detecting platform…", p: "Medusa picks install methods that fit your system." },
+        { kind: "ok", t: d ? `${d.platform}` : "Detecting platform…", p: "Cipher picks install methods that fit your system." },
         { kind: "ok", t: d ? `PATH resolves tools (${d.tools_installed}/${d.tools_total} installed)` : "Scanning PATH…", p: "Tools are found on PATH and in known install folders." },
       ]},
       { title: "Security capabilities", rows: [
-        { kind: d && d.caps_covered > 0 ? "ok" : "warn", t: d ? `${d.caps_covered}/${d.caps_total} capabilities covered` : "Scoring capabilities…", p: "What Medusa can actually use on this machine." },
+        { kind: d && d.caps_covered > 0 ? "ok" : "warn", t: d ? `${d.caps_covered}/${d.caps_total} capabilities covered` : "Scoring capabilities…", p: "What Cipher can actually use on this machine." },
         { kind: "ok", t: "Packet capture", p: "TShark/tcpdump adapters parse capture output." },
       ]},
       { title: "Connectivity and package managers", rows: [
-        { kind: "ok", t: "winget, cargo, npm, go", p: "Used to suggest install commands. Medusa only shows them." },
+        { kind: "ok", t: "winget, cargo, npm, go", p: "Used to suggest install commands. Cipher only shows them." },
       ]},
     ];
     return (
@@ -1145,7 +1356,7 @@ export default function App() {
           ))}
         </div>
         <div className="group-h" style={{ marginTop: 28 }}><h2>Issues to look at</h2><small>{d ? `${d.issues.length} found` : "scanning…"}</small></div>
-        {d && d.issues.length === 0 && <div className="issue"><div><b>No issues</b><p>Everything Medusa needs is in place.</p></div></div>}
+        {d && d.issues.length === 0 && <div className="issue"><div><b>No issues</b><p>Everything Cipher needs is in place.</p></div></div>}
         {d?.issues.map((iss, i) => (
           <div className="issue" key={i}><div><b>Issue {i + 1}</b><p>{iss}</p></div><button className="btn sm" onClick={doRefresh}>Refresh tools</button></div>
         ))}
@@ -1298,7 +1509,7 @@ function Drawer({ id, onClose, doRefresh }: { id: string; onClose: () => void; d
           </section>
           {!t.installed && (
             <section><h2 style={{ marginBottom: 4 }}>Install {t.name}</h2>
-              <p className="small-note" style={{ marginBottom: 12 }}>Medusa doesn&apos;t run installers. Use the official source, then refresh tools.</p>
+              <p className="small-note" style={{ marginBottom: 12 }}>Cipher doesn&apos;t run installers. Use the official source, then refresh tools.</p>
               <div className="method"><span className="kind docs">Official documentation</span>
                 <span className="mono" style={{ fontSize: 12.5, color: "var(--ink-2)" }}>{t.docs_url}</span>
                 <a className="btn sm" style={{ alignSelf: "flex-start", textDecoration: "none" }} href={`https://${t.docs_url}`} target="_blank" rel="noreferrer">Open documentation</a>
@@ -1306,6 +1517,87 @@ function Drawer({ id, onClose, doRefresh }: { id: string; onClose: () => void; d
               <div style={{ marginTop: 14 }}><button className="btn" onClick={doRefresh}>Refresh tools</button></div>
             </section>
           )}
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function TraceDrawer({ sessionId, live, onClose }: { sessionId: string; live: boolean; onClose: () => void }) {
+  const [entries, setEntries] = useState<TraceEntry[]>([]);
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  const [err, setErr] = useState("");
+  const [area, setArea] = useState("ALL");
+  const [failures, setFailures] = useState(false);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState<Set<number>>(new Set());
+  const load = async () => {
+    try {
+      const tail = await invoke<TraceTail>("get_trace", { session_id: sessionId, max_lines: 500 });
+      setEntries(tail.entries);
+      setTotal(tail.total);
+      setTruncated(tail.truncated);
+      setErr("");
+    } catch (e) { setErr(String(e)); }
+  };
+  useEffect(() => { load(); }, [sessionId]);
+  // Live tail while the session runs; paused when idle or closed.
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(load, 2000);
+    return () => window.clearInterval(id);
+  }, [live, sessionId]);
+  const areas = useMemo(() => {
+    const s = new Set(entries.map((e) => e.tag.split(".")[0]));
+    return ["ALL", ...[...s].sort()];
+  }, [entries]);
+  const shown = entries.filter((e) => {
+    if (area !== "ALL" && !e.tag.startsWith(area + ".")) return false;
+    if (failures) {
+      const failedResult = e.tag === "TOOL.RESULT" && (e.data as { success?: boolean } | null)?.success === false;
+      if (!TRACE_FAILURE_TAGS.has(e.tag) && !failedResult) return false;
+    }
+    if (query && !(e.tag + " " + e.msg + " " + JSON.stringify(e.data)).toLowerCase().includes(query.toLowerCase())) return false;
+    return true;
+  });
+  const toggle = (ts: number) => setOpen((o) => {
+    const n = new Set(o);
+    if (n.has(ts)) n.delete(ts); else n.add(ts);
+    return n;
+  });
+  return (
+    <>
+      <div className="scrim on" onClick={onClose} />
+      <aside className="drawer on trace-drawer" aria-label="Session debug trace">
+        <div className="dr-h"><span className="tav">T</span>
+          <div><h2>Trace</h2><p>{truncated ? `latest ${entries.length} of ${total} lines` : `${total} lines`} · secrets redacted</p></div>
+          <button className="x" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        <div className="trace-filters">
+          <div className="trace-chips">
+            {areas.map((a) => (
+              <button key={a} className={`chip${area === a ? " on" : ""}`} onClick={() => setArea(a)}>{a}</button>
+            ))}
+            <button className={`chip${failures ? " on" : ""}`} onClick={() => setFailures((v) => !v)}>FAILURES</button>
+          </div>
+          <input className="trace-search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Filter text or step…" aria-label="Filter trace" />
+        </div>
+        <div className="dr-b trace-body">
+          {err && <p className="trace-err">{err}</p>}
+          {!err && shown.length === 0 && <p className="small-note">No trace lines yet — they appear as the session works.</p>}
+          {shown.map((e, i) => (
+            <div className="trace-row" key={`${e.ts}-${i}`}>
+              <button className="trace-head" onClick={() => toggle(e.ts * 1000 + i)}>
+                <span className="trace-tag">{e.tag}</span>
+                <span className="trace-msg">{e.msg}</span>
+                <span className="trace-meta">step {e.step} · {new Date(e.ts).toLocaleTimeString()}</span>
+              </button>
+              {open.has(e.ts * 1000 + i) && (
+                <pre className="trace-json">{JSON.stringify(e.data, null, 1)}</pre>
+              )}
+            </div>
+          ))}
         </div>
       </aside>
     </>
@@ -1321,7 +1613,7 @@ function ApprovalModal({ approval, onChoose, onDeny, customAns, setCustomAns, on
   return (
     <div className="sheetwrap" onClick={onDeny}>
       <div className="sheet" role="dialog" aria-label={approval.title} onClick={(e) => e.stopPropagation()} style={{ width: "min(520px,100%)" }}>
-        <div className="brand"><Logo z={30} /><span>Medusa</span></div>
+        <div className="brand"><Logo z={30} /><span>Cipher</span></div>
         <h2 style={{ fontSize: 22 }}>{approval.title}</h2>
         <p className="sub" style={{ whiteSpace: "pre-wrap" }}>{approval.message}</p>
         <div className="approve" style={{ border: 0, padding: 0 }}>
@@ -1389,7 +1681,7 @@ function FirstRunSheet({ onDone, onTools }: { onDone: () => void; onTools: () =>
   return (
     <div className="sheetwrap">
       <div className="sheet" role="dialog" aria-labelledby="frT">
-        <div className="brand"><Logo z={30} /><span>Medusa</span></div>
+        <div className="brand"><Logo z={30} /><span>Cipher</span></div>
         <h2 id="frT">Checking your environment</h2>
         <p className="sub">Looking for security tools on this machine. Nothing is installed or changed.</p>
         <div>{rows.map((r) => (
@@ -1400,8 +1692,8 @@ function FirstRunSheet({ onDone, onTools }: { onDone: () => void; onTools: () =>
             {bars && bars.map((b) => (
               <div className="brow" key={b.n}><span>{b.n}</span><span className="b"><i style={{ width: `${b.w}%` }} /></span><span>{b.w}%</span></div>
             ))}
-            <p className="fr-foot">Missing tools are fine. Medusa works with what you have and tells you what it can&apos;t cover.</p>
-            <div className="fr-act"><button className="btn" onClick={onTools}>Review tools</button><button className="btn pri" onClick={onDone}>Continue to Medusa</button></div>
+            <p className="fr-foot">Missing tools are fine. Cipher works with what you have and tells you what it can&apos;t cover.</p>
+            <div className="fr-act"><button className="btn" onClick={onTools}>Review tools</button><button className="btn pri" onClick={onDone}>Continue to Cipher</button></div>
           </div>
         )}
       </div>

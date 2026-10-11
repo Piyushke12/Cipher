@@ -458,7 +458,7 @@ pub fn builtin_tools() -> Vec<ToolDefinition> {
     v.push(katana);
 
     // BrowserProvider as first-class capability — same AgentRuntime, new provider via Playwright sidecar.
-    // Medusa Rust â†’ `node <state_dir>/scripts/browser-observe.mjs --url {target} --json`
+    // Cipher Rust â†’ `node <state_dir>/scripts/browser-observe.mjs --url {target} --json`
     // â†’ Playwright â†’ headless Chromium. The sidecar script is embedded in the
     // binary (`infra::scripts`) and written to the state dir on first use via
     // the `{script:...}` placeholder; `node` is the resolved executable and a
@@ -1422,7 +1422,7 @@ pub fn builtin_tools() -> Vec<ToolDefinition> {
     // of a CLI ProcessProvider.
     let mut medusa_http = def(
         "medusa-http",
-        "Medusa HTTP",
+        "Cipher HTTP",
         ToolCategory::HttpWebDiscovery,
         "Built-in raw HTTP request provider (no external tool).",
         &["http.request", "api.auth_testing", "api.bola_testing"],
@@ -1435,6 +1435,26 @@ pub fn builtin_tools() -> Vec<ToolDefinition> {
     );
     medusa_http.builtin = true;
     v.push(medusa_http);
+
+    // medusa-research: web content fetch + extract built into the agent
+    // (the ResearchProvider). Like medusa-http it has no external binary;
+    // `builtin: true` means discovery reports it available without a PATH
+    // probe and the runtime serves web.research from the internal provider.
+    let mut medusa_research = def(
+        "medusa-research",
+        "Cipher Research",
+        ToolCategory::HttpWebDiscovery,
+        "Built-in web research provider: fetch and read web pages (no external tool).",
+        &["web.research"],
+        &[], // no executable: built into medusa
+        &[], // no version probe needed
+        "https://github.com/piyus/medusa",
+        adapter("research_json", true),
+        40,
+        &[],
+    );
+    medusa_research.builtin = true;
+    v.push(medusa_research);
 
     v
 }

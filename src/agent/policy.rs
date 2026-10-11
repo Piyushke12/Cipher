@@ -259,7 +259,22 @@ impl ExecutionPolicy {
                 details,
             });
         }
-        if !self.scope.is_in_scope(&request.target) {
+        if let Err(details) = validate_http_request_shape(&request.capability, &request.options)
+        {
+            return Err(PolicyError::InvalidArguments {
+                capability: request.capability.clone(),
+                details,
+            });
+        }
+        // Read-only web research (docs, source, CVEs) is NOT an attack on
+        // the host it reads, so it is exempt from the assessment-scope
+        // pin — the same treatment as the direct `web_search` tool. The
+        // target IS the scope for every active/attack capability; research
+        // reads deliberately reach the broader web (e.g. a target's own
+        // source on GitHub, which is otherwise un-exploitable blind).
+        if !is_research_capability(&request.capability)
+            && !self.scope.is_in_scope(&request.target)
+        {
             return Err(PolicyError::OutOfScope {
                 target: request.target.clone(),
                 scope: self.scope.scope_target(),
@@ -284,6 +299,70 @@ impl ExecutionPolicy {
     }
 }
 
+/// Read-only research capabilities: they fetch public web content (docs,
+/// source, CVE pages) rather than acting on the target, so they are not
+/// bound by the assessment scope (see `validate`).
+fn is_research_capability(capability: &str) -> bool {
+    crate::agent::RESEARCH_CAPABILITIES.contains(&capability)
+}
+
+/// Capabilities whose requests are built by the HTTP provider (raw
+/// request issuing with semantic method/headers/body options).
+fn is_http_capability(capability: &str) -> bool {
+    matches!(
+        capability,
+        "http.request" | "api.auth_testing" | "api.bola_testing"
+    )
+}
+
+/// Cross-option shape check for HTTP requests: a body without a
+/// Content-Type is almost certainly a model mistake (servers reject or
+/// misparse it), so fail fast with an actionable error instead of
+/// burning a tool call on a 4xx.
+fn validate_http_request_shape(capability: &str, options: &OptionSet) -> Result<(), String> {
+    if !is_http_capability(capability) {
+        return Ok(());
+    }
+    let has_body = options.get("body").is_some_and(|v| match v {
+        OptionValue::Str(s) => !s.trim().is_empty(),
+        _ => true,
+    });
+    if !has_body {
+        return Ok(());
+    }
+    let has_content_type = options.get("headers").is_some_and(|v| match v {
+        OptionValue::Map(map) => map.keys().any(|k| k.eq_ignore_ascii_case("content-type")),
+        _ => false,
+    });
+    if !has_content_type {
+        return Err(
+            "body is present but no Content-Type header was given: add it to `headers`, e.g. {\"Content-Type\": \"application/json\"}".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Legacy migration adapter: convert strictly well-formed `;`-separated
+/// header strings into structured maps BEFORE policy validation, using
+/// the capability schema. Anything ambiguous (newlines, comma-joined
+/// blobs, missing colons) is left as a string so policy rejects it with
+/// an actionable error naming the object format — never silently merged.
+pub fn normalize_request_options(def: &CapabilityDefinition, options: &mut OptionSet) {
+    use crate::model::OptionKind;
+    for spec in &def.options {
+        if !matches!(spec.kind, OptionKind::Map) {
+            continue;
+        }
+        let convertible = match options.get(&spec.name) {
+            Some(OptionValue::Str(s)) => super::http_headers::parse_legacy_headers(s).ok(),
+            _ => None,
+        };
+        if let Some(pairs) = convertible {
+            let map: std::collections::BTreeMap<String, String> = pairs.into_iter().collect();
+            options.insert(spec.name.clone(), OptionValue::Map(map));
+        }
+    }
+}
 /// Validate semantic options against the capability's schema. Unknown
 /// options, wrong types, out-of-range numbers, and invalid enum members
 /// are rejected — raw flags/commands can never pass through because they
@@ -340,6 +419,17 @@ pub fn validate_options(def: &CapabilityDefinition, options: &OptionSet) -> Resu
                         "option `{name}` must be one of: {} (got \"{s}\")",
                         values.join("|")
                     ));
+                }
+            }
+            crate::model::OptionKind::Map => {
+                let OptionValue::Map(map) = value else {
+                    return Err(format!(
+                        "option `{name}` must be an object of string pairs, e.g. {{\"Authorization\": \"Bearer <token>\"}} (got {}) — legacy delimiter-joined strings are auto-converted only when they are strictly `Name: value` pairs separated by `;`; newline- or comma-joined text is ambiguous and rejected, pass an object instead",
+                        value.kind_name()
+                    ));
+                };
+                if let Err(e) = super::http_headers::validate_header_map(map) {
+                    return Err(format!("option `{name}`: {e}"));
                 }
             }
         }
@@ -496,6 +586,33 @@ mod tests {
     }
 
     #[test]
+    fn web_research_reaches_off_scope_hosts_but_attacks_do_not() {
+        let policy = ExecutionPolicy::default().for_target("127.0.0.1");
+        // Reading a target's own source on GitHub is research, not an
+        // attack on GitHub — allowed despite being off the 127.0.0.1 pin.
+        assert!(
+            policy
+                .validate(
+                    &request(
+                        "web.research",
+                        "https://raw.githubusercontent.com/juice-shop/juice-shop/master/data/static/challenges.yml"
+                    ),
+                    &caps()
+                )
+                .is_ok(),
+            "web.research must not be blocked by assessment scope"
+        );
+        // An active capability against the same off-scope host is still
+        // rejected — the exemption is research-only.
+        assert!(matches!(
+            policy
+                .validate(&request("http.probe", "https://raw.githubusercontent.com/x"), &caps())
+                .unwrap_err(),
+            PolicyError::OutOfScope { .. }
+        ));
+    }
+
+    #[test]
     fn out_of_scope_is_a_distinct_rejection() {
         let policy = ExecutionPolicy::default().for_target("www.itsecgames.com");
         let err = policy
@@ -541,8 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn host_of_strips_everything_but_the_host() {
-        assert_eq!(
+    fn host_of_strips_everything_but_the_host() {        assert_eq!(
             host_of("http://User:pw@EXAMPLE.com:8080/a/b?x=1#f"),
             "example.com"
         );
@@ -550,5 +666,117 @@ mod tests {
         assert_eq!(host_of("example.com."), "example.com");
         assert_eq!(host_of("[::1]:8080/x"), "::1");
         assert_eq!(host_of("plainhost"), "plainhost");
+    }
+
+    fn headers_map(pairs: &[(&str, &str)]) -> OptionValue {
+        OptionValue::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn http_request(target: &str) -> CapabilityRequest {
+        request("http.request", target)
+    }
+
+    #[test]
+    fn headers_object_passes_validation() {
+        let mut r = http_request("http://127.0.0.1:9/");
+        r.options.insert(
+            "headers".into(),
+            headers_map(&[("Authorization", "Bearer abc"), ("Content-Type", "application/json")]),
+        );
+        assert!(ExecutionPolicy::default().validate(&r, &caps()).is_ok());
+    }
+
+    #[test]
+    fn headers_object_rejects_bad_names_and_multiline_values() {
+        for (name, value) in [("Bad Name", "v"), ("X-Ok", "a\nb"), ("", "v")] {
+            let mut r = http_request("http://127.0.0.1:9/");
+            r.options.insert("headers".into(), headers_map(&[(name, value)]));
+            let err = ExecutionPolicy::default().validate(&r, &caps()).unwrap_err();
+            match err {
+                PolicyError::InvalidArguments { details, .. } => {
+                    assert!(details.contains("headers"), "{details}");
+                }
+                other => panic!("expected InvalidArguments, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_strict_headers_string_is_migrated() {
+        let def = caps().get("http.request").unwrap().clone();
+        let mut options = OptionSet::new();
+        options.insert(
+            "headers".into(),
+            OptionValue::Str("Authorization: Bearer abc; Content-Type: application/json".into()),
+        );
+        normalize_request_options(&def, &mut options);
+        assert!(
+            matches!(options.get("headers"), Some(OptionValue::Map(m)) if m.len() == 2),
+            "strict string must migrate to Map: {options:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_headers_are_rejected_not_merged() {
+        // Newline-joined and comma-glued blobs stay strings through the
+        // adapter; policy rejects them naming the object format.
+        for blob in [
+            "Authorization: Bearer abc\nContent-Type: application/json",
+            "Authorization: Bearer abc, Content-Type: application/json",
+            "garbage without colon",
+        ] {
+            let def = caps().get("http.request").unwrap().clone();
+            let mut options = OptionSet::new();
+            options.insert("headers".into(), OptionValue::Str(blob.into()));
+            normalize_request_options(&def, &mut options);
+            assert!(
+                matches!(options.get("headers"), Some(OptionValue::Str(_))),
+                "ambiguous text must NOT migrate: {blob}"
+            );
+            let mut r = http_request("http://127.0.0.1:9/");
+            r.options = options;
+            let err = ExecutionPolicy::default().validate(&r, &caps()).unwrap_err();
+            match err {
+                PolicyError::InvalidArguments { details, .. } => {
+                    assert!(details.contains("object"), "{details}");
+                }
+                other => panic!("expected InvalidArguments, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn body_without_content_type_is_rejected() {
+        let mut r = http_request("http://127.0.0.1:9/");
+        r.options.insert(
+            "headers".into(),
+            headers_map(&[("Authorization", "Bearer abc")]),
+        );
+        r.options
+            .insert("body".into(), OptionValue::Str(r#"{"a":1}"#.into()));
+        let err = ExecutionPolicy::default().validate(&r, &caps()).unwrap_err();
+        match err {
+            PolicyError::InvalidArguments { details, .. } => {
+                assert!(details.contains("Content-Type"), "{details}");
+            }
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_with_content_type_passes() {
+        let mut r = http_request("http://127.0.0.1:9/");
+        r.options.insert(
+            "headers".into(),
+            headers_map(&[("Content-Type", "application/json")]),
+        );
+        r.options
+            .insert("body".into(), OptionValue::Str(r#"{"a":1}"#.into()));
+        assert!(ExecutionPolicy::default().validate(&r, &caps()).is_ok());
     }
 }

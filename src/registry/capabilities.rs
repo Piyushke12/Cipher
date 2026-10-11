@@ -166,7 +166,7 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             cap(
                 "http.request",
                 "http",
-                "Issue a raw HTTP request to verify business-logic behavior (login bypass, IDOR, auth). Target = full URL.",
+                "Issue a raw HTTP request to verify business-logic behavior (login bypass, IDOR, auth). Target = full URL. For a large response body, pass `grep` to jump to the part you need, or `offset` to page through — the body is windowed, so re-issuing the same request just returns the same head.",
                 I::High,
             ),
             vec![
@@ -187,8 +187,8 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
                 ),
                 opt(
                     "headers",
-                    OptionKind::Str,
-                    "Request headers as \"Name: value\" pairs separated by \";\", e.g. \"Authorization: Bearer x; Content-Type: application/json\".",
+                    OptionKind::Map,
+                    "Request headers as an object of name/value pairs, e.g. {\"Authorization\": \"Bearer x\", \"Content-Type\": \"application/json\"}.",
                 ),
                 opt(
                     "body",
@@ -199,6 +199,21 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
                     "follow_redirects",
                     OptionKind::Bool,
                     "Follow 3xx redirects (default true).",
+                ),
+                opt(
+                    "path",
+                    OptionKind::Str,
+                    "Optional URL path to request, e.g. \"/rest/products/search\". Normally the path is part of the target URL; if given here it is resolved against the target's origin (host/port), overriding any path in the target.",
+                ),
+                opt(
+                    "grep",
+                    OptionKind::Str,
+                    "Return a window of the response body centered on the FIRST case-insensitive match of this text instead of the body head — use it to jump straight to the relevant part of a large response (e.g. a specific challenge key or field).",
+                ),
+                opt(
+                    "offset",
+                    OptionKind::Number { min: Some(0.0), max: None },
+                    "Character offset to start the body window from (default 0). Page through a large body by increasing it; the window length is fixed. Ignored when `grep` matches.",
                 ),
             ],
         ),
@@ -211,14 +226,26 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
             cap(
                 "web.research",
                 "web",
-                "Fetch and read web content (documentation, GitHub code, web pages) to research a topic, CVE, or target. Target = URL to read.",
+                "Fetch and read web content (documentation, GitHub code, web pages) to research a topic, CVE, or target. Target = URL to read. For a large page/file, pass `grep` to jump to the part you need, or `offset` to page through — the extract is windowed, so blindly re-fetching the same URL just returns the same head.",
                 I::Medium,
             ),
-            vec![opt(
-                "selector",
-                OptionKind::Str,
-                "Reserved: target a specific element/selector. Whole-page extraction is used for now.",
-            )],
+            vec![
+                opt(
+                    "grep",
+                    OptionKind::Str,
+                    "Return a window centered on the FIRST case-insensitive match of this text instead of the page head — use it to jump straight to the relevant section of a large file (e.g. a challenge key or function name).",
+                ),
+                opt(
+                    "offset",
+                    OptionKind::Number { min: Some(0.0), max: None },
+                    "Character offset to start the extract from (default 0). Page through a large file by increasing it; the window length is fixed. Ignored when `grep` matches.",
+                ),
+                opt(
+                    "selector",
+                    OptionKind::Str,
+                    "Reserved: target a specific element/selector. Whole-page extraction is used for now.",
+                ),
+            ],
         ),
         // Web security testing
         with_options(
@@ -489,7 +516,7 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
                 "Listener lifecycle: start (get callback URL), check (list interactions), stop (clean up).",
             )],
         ),
-        // Browser — Playwright sidecar/worker, Chromium via Medusa Rust → BrowserProvider.
+        // Browser — Playwright sidecar/worker, Chromium via Cipher Rust → BrowserProvider.
         // Initial capability is browser.network.observe (SPA API discovery); other browser.*
         // capabilities are provider-driven, not agent-loop changes.
         cap(
@@ -617,8 +644,8 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
                 ),
                 opt(
                     "headers",
-                    OptionKind::Str,
-                    "Request headers as \"Name: value\" pairs separated by \";\". Omit Authorization to test missing-auth access.",
+                    OptionKind::Map,
+                    "Request headers as an object of name/value pairs. Omit Authorization to test missing-auth access.",
                 ),
                 opt(
                     "body",
@@ -652,8 +679,8 @@ pub fn builtin_capabilities() -> Vec<CapabilityDefinition> {
                 ),
                 opt(
                     "headers",
-                    OptionKind::Str,
-                    "Request headers as \"Name: value\" pairs separated by \";\" (e.g. an Authorization token for the legit user).",
+                    OptionKind::Map,
+                    "Request headers as an object of name/value pairs (e.g. an Authorization token for the legit user).",
                 ),
                 opt(
                     "body",

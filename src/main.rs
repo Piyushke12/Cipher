@@ -28,6 +28,11 @@ fn full_scan(
 }
 
 fn main() {
+    // Prune debug-trace files older than 30 days before serving.
+    medusa_lib::infra::trace::TraceWriter::prune_older_than(
+        &medusa_lib::infra::trace::traces_dir(),
+        30,
+    );
     let args: Vec<String> = std::env::args().collect();
     let force_refresh = args.iter().any(|a| a == "--refresh" || a == "-r");
     let no_scan = args.iter().any(|a| a == "--no-scan");

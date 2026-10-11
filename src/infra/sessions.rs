@@ -63,6 +63,10 @@ pub enum SessionRecord {
     Think { text: String },
     /// Assessment started (or re-scoped) on a target.
     Target { target: String },
+    /// User renamed the session from the sidebar. Append-only like every
+    /// other record — the header's original `title` is left untouched;
+    /// the latest `Rename` wins on replay (see `summarize`).
+    Rename { title: String },
     /// Capability requested — opens a tool step card. `model_secs` is the
     /// cumulative LLM time for the decision that requested it (incl.
     /// retries); 0 on legacy records.
@@ -321,6 +325,9 @@ fn summarize(path: &Path, id: &str) -> Option<SessionSummary> {
                     summary.target = Some(target);
                 }
             }
+            SessionRecord::Rename { title } => {
+                summary.title = title;
+            }
             _ => {}
         }
         summary.time_updated = timed.time;
@@ -421,6 +428,27 @@ mod tests {
         assert!(
             matches!(&recs[2].record, SessionRecord::Target { target } if target == "scanme.nmap.org")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_updates_the_summary_title() {
+        let dir = temp_dir("rename");
+        let mut w = SessionWriter::create_in(&dir, "First scan", None).unwrap();
+        let id = w.id().to_string();
+        w.append(SessionRecord::Rename {
+            title: "Renamed scan".into(),
+        })
+        .unwrap();
+        let summary = list_sessions_in(&dir)
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap();
+        assert_eq!(summary.title, "Renamed scan");
+        // The header line is untouched — rename is append-only like
+        // every other record.
+        let recs = load_session_in(&dir, &id).unwrap();
+        assert!(matches!(&recs[0].record, SessionRecord::Session { title, .. } if title == "First scan"));
         let _ = fs::remove_dir_all(&dir);
     }
 

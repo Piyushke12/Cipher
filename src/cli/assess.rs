@@ -9,9 +9,11 @@ use console::style;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 
 use crate::agent::{
-    AgentEvent, AgentRuntime, CliProvider, Decision, FinishReason, InvestigationResult,
-    ModelProvider, OpenAiCompatibleProvider, OptionSet, ProviderRegistry, StubProvider, Target,
+    AgentEvent, AgentRuntime, AssessmentState, CliProvider, Decision, FinishReason,
+    InvestigationResult, ModelProvider, OpenAiCompatibleProvider, OptionSet, ProviderRegistry,
+    StubProvider, Target,
 };
+use crate::infra::trace::{TraceEntry, TraceWriter};
 use crate::model::EnvironmentState;
 use crate::registry::{CapabilityRegistry, ToolRegistry};
 
@@ -57,7 +59,7 @@ impl EventRenderer {
             AgentEvent::InvestigationStarted { target } => {
                 println!(
                     "\n{}",
-                    style(format!("Medusa — investigating {target}"))
+                    style(format!("Cipher — investigating {target}"))
                         .cyan()
                         .bold()
                 );
@@ -78,6 +80,9 @@ impl EventRenderer {
             }
             AgentEvent::Narrated { text } => {
                 println!("\n{text}\n");
+            }
+            AgentEvent::UserMessageSeen { text } => {
+                println!("{}", style(format!("You: {text}")).cyan());
             }
             AgentEvent::CapabilityRequested {
                 capability,
@@ -187,12 +192,18 @@ impl EventRenderer {
                 limit_tokens,
                 pct,
                 estimated,
+                cached_tokens,
             } => {
                 println!(
                     "  {}",
                     style(format!(
-                        "context {used_tokens}/{limit_tokens} ({pct}%){}",
-                        if *estimated { " (est.)" } else { "" }
+                        "context {used_tokens}/{limit_tokens} ({pct}%){}{}",
+                        if *estimated { " (est.)" } else { "" },
+                        if *cached_tokens > 0 {
+                            format!(" [{} cached]", cached_tokens)
+                        } else {
+                            String::new()
+                        }
                     ))
                     .dim()
                 );
@@ -225,10 +236,39 @@ impl EventRenderer {
             AgentEvent::VaultRecalled { key } => {
                 println!("  {}", style(format!("vault: recalled {key}")).dim());
             }
+            AgentEvent::HypothesisCreated { statement, family } => {
+                println!("  {}", style(format!("hypothesis [{family}]: {statement}")).yellow());
+            }
+            AgentEvent::FindingUpdated { id, stage, note } => {
+                println!("  {}", style(format!("finding {id} -> {stage}: {note}")).bold());
+            }
+            AgentEvent::AttackGraphUpdated { nodes, edges, newly_reachable } => {
+                println!("  {}", style(format!("attack graph: {nodes} nodes / {edges} edges; new: {}", newly_reachable.join(", "))).dim());
+            }
+            AgentEvent::SecurityTestProgressUpdated { family, status } => {
+                println!("  {}", style(format!("family {family}: {status}")).dim());
+            }
+            AgentEvent::CompletionEvaluated { allowed, reason, remaining } => {
+                println!("  {}", style(format!("completion: {} ({reason}, {remaining} remaining)", if *allowed { "allowed" } else { "rejected" })).dim());
+            }
+            AgentEvent::ActionBlocked { reason } => {
+                println!("  {} {}", style("! blocked:").red().bold(), style(reason).red());
+            }
         }
     }
 
     pub fn summary(&mut self, res: &InvestigationResult) {
+        self.summary_with_state(res, None);
+    }
+
+    /// Summary plus authoritative assessment views (families, findings,
+    /// attack path, identity/privilege, unknowns, completion). All data
+    /// comes from runtime state, never hardcoded UI data.
+    pub fn summary_with_state(
+        &mut self,
+        res: &InvestigationResult,
+        assessment: Option<&AssessmentState>,
+    ) {
         self.spinner.stop();
         println!("\n{}", style("Investigation summary").bold());
         println!("  steps: {}", res.steps_taken);
@@ -249,7 +289,116 @@ impl EventRenderer {
                 a.target
             );
         }
+        if let Some(state) = assessment {
+            render_assessment_summary(state);
+        }
     }
+}
+
+/// Render families / findings / attack path / identity / unknowns /
+/// completion from authoritative runtime state.
+pub fn render_assessment_summary(state: &AssessmentState) {
+    print!("{}", assessment_summary_text(state));
+}
+
+/// Same content as [`render_assessment_summary`] as a string (TUI/workers).
+pub fn assessment_summary_text(state: &AssessmentState) -> String {
+    use crate::agent::completeness::AssessmentStatus;
+    let mut out = String::new();
+    out.push_str("\nAssessment\n");
+    let (hosts, ports, endpoints, params) = state.target_model.counts();
+    out.push_str(&format!("  attack surface: {hosts} hosts / {ports} ports / {endpoints} endpoints / {params} params\n"));
+    if let Some(id) = &state.target_model.current_identity {
+        out.push_str(&format!("  identity: {id}\n"));
+    }
+    out.push_str("\nVulnerability Families\n");
+    if state.family_progress.is_empty() {
+        out.push_str("    (no family progress tracked)\n");
+    }
+    for p in &state.family_progress {
+        let mark = match p.status {
+            AssessmentStatus::ConfirmedFinding => "✓",
+            AssessmentStatus::Tested => "✓",
+            AssessmentStatus::InProgress => "~",
+            AssessmentStatus::NotStarted => "○",
+            AssessmentStatus::Blocked => "!",
+            AssessmentStatus::NotApplicable => "-",
+        };
+        out.push_str(&format!(
+            "    {mark} {}  {}/{} questions, {} evidence\n",
+            p.family, p.tested_questions, p.total_questions, p.evidence_count
+        ));
+    }
+    out.push_str("\nFindings\n");
+    if state.findings.findings.is_empty() {
+        out.push_str("    (none)\n");
+    }
+    for f in &state.findings.findings {
+        out.push_str(&format!(
+            "    ◆ F{} [{:?}] {} ({}) severity={} evidence={}\n",
+            f.id,
+            f.stage,
+            f.title,
+            f.target,
+            f.severity,
+            f.evidence_ids.len()
+        ));
+    }
+    out.push_str("\nAttack Path\n");
+    let privs: Vec<String> = state
+        .attack_graph
+        .privileges()
+        .iter()
+        .map(|n| n.label.clone())
+        .collect();
+    if privs.is_empty() && state.attack_graph.nodes.is_empty() {
+        out.push_str("    (no attack graph nodes yet)\n");
+    } else {
+        if !privs.is_empty() {
+            out.push_str(&format!("    privileges: {}\n", privs.join(", ")));
+        }
+        // Longest known directed chain ending at a privilege/resource.
+        let mut shown = false;
+        let nodes: Vec<String> = state.attack_graph.nodes.keys().cloned().collect();
+        'outer: for from in &nodes {
+            for to in &nodes {
+                if let Some(path) = state.attack_graph.path(from, to) {
+                    if path.len() >= 3 {
+                        out.push_str(&format!("    {}\n", path.join("\n    ↓\n    ")));
+                        shown = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if !shown {
+            out.push_str(&format!(
+                "    nodes={} edges={}\n",
+                state.attack_graph.nodes.len(),
+                state.attack_graph.edges.len()
+            ));
+        }
+    }
+    out.push_str("\nUnknowns\n");
+    let unknowns = state.investigation.unresolved_high_value(70);
+    if unknowns.is_empty() {
+        out.push_str("    (none high-value)\n");
+    }
+    for o in unknowns.iter().take(8) {
+        out.push_str(&format!(
+            "    ? [{}] {} (via {})\n",
+            o.family,
+            o.question,
+            o.resolving_capability.as_deref().unwrap_or("reasoning")
+        ));
+    }
+    out.push_str(&format!(
+        "\nCompletion: {} families tracked, {} evidence records, snapshot `{}`\n",
+        state.family_progress.len(),
+        state.evidence.records.len(),
+        state.id
+    ));
+    out
 }
 
 impl Default for EventRenderer {
@@ -343,6 +492,7 @@ pub fn select_model(state: &EnvironmentState) -> (Box<dyn ModelProvider>, String
                 cfg.args.clone(),
                 cfg.label.clone(),
                 cfg.timeout_secs,
+                cfg.stdin_prompt,
             );
             let label = format!("{} (local harness `{}`)", p.name(), cfg.exe);
             (Box::new(p), label)
@@ -352,6 +502,32 @@ pub fn select_model(state: &EnvironmentState) -> (Box<dyn ModelProvider>, String
             "stub (demo — no model configured)".to_string(),
         ),
     }
+}
+
+/// File-only debug trace sink for CLI/TUI runs (no drawer there — the
+/// JSONL file is the UI). Returns the trace id plus an append closure for
+/// `AgentRuntime::with_tracer`. Best-effort: falls back to a temp file.
+pub fn cli_tracer(prefix: &str) -> (String, impl FnMut(TraceEntry) + Send) {
+    let id = format!(
+        "{prefix}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let writer = TraceWriter::open(&id).unwrap_or_else(|_| {
+        TraceWriter::open_in(&std::env::temp_dir(), &format!("trace-fallback-{id}"))
+            .expect("temp trace writer")
+    });
+    // The id doubles as documentation of where the file went; the writer
+    // owns the handle inside the returned closure.
+    let mut writer = writer;
+    (
+        id,
+        move |entry: TraceEntry| {
+            writer.append(&entry);
+        },
+    )
 }
 
 /// Entry point for `/assess <target>`. Picks the real model when
@@ -377,6 +553,13 @@ pub fn run_assessment(
     println!("\n{}", style("Investigation").bold());
     let rt = AgentRuntime::new(model, tools, caps, state);
     let mut ui = EventRenderer::new();
-    let res = rt.investigate_with(Target::new(target), &mut |ev| ui.on_event(&ev));
-    ui.summary(&res);
+    let (trace_id, tracer) = cli_tracer("cli");
+    println!(
+        "  {}",
+        style(format!("trace: <state-dir>/sessions/{trace_id}.trace.jsonl")).dim()
+    );
+    let rt = rt.with_tracer(tracer);
+    let (res, assessment) =
+        rt.investigate_with_state(Target::new(target), &mut |ev| ui.on_event(&ev));
+    ui.summary_with_state(&res, Some(&assessment));
 }

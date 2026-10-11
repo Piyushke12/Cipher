@@ -98,6 +98,10 @@ pub enum AgentEvent {
         /// True when the numbers are a char/4 estimate (endpoint omitted
         /// the `usage` block) rather than provider-reported.
         estimated: bool,
+        /// Tokens served from the provider's prefix cache (0 when the
+        /// endpoint doesn't report it). The operational signal for the
+        /// cache-first context architecture — UIs show the hit share.
+        cached_tokens: u64,
     },
     /// Auto (or manual) compaction replaced older turns with a summary.
     /// `before_tokens`/`after_tokens` are the window usage around the
@@ -127,6 +131,32 @@ pub enum AgentEvent {
         statement: String,
         confidence: String,
     },
+    HypothesisCreated {
+        statement: String,
+        family: String,
+    },
+    FindingUpdated {
+        id: usize,
+        stage: String,
+        note: String,
+    },
+    AttackGraphUpdated {
+        nodes: usize,
+        edges: usize,
+        newly_reachable: Vec<String>,
+    },
+    SecurityTestProgressUpdated {
+        family: String,
+        status: String,
+    },
+    CompletionEvaluated {
+        allowed: bool,
+        reason: String,
+        remaining: usize,
+    },
+    ActionBlocked {
+        reason: String,
+    },
     ActionRejected {
         reason: String,
     },
@@ -146,6 +176,15 @@ pub enum AgentEvent {
     /// milestone). Does NOT end the turn — the loop continues. UIs
     /// render it as a normal agent message, not a thinking card.
     Narrated {
+        text: String,
+    },
+    /// A user message that arrived mid-turn was folded into the running
+    /// turn (see `AgentRuntime::with_input_drain`): it is now in the
+    /// conversation the model sees, without stopping the turn. UIs
+    /// already show the user's bubble optimistically on send; this exists
+    /// so the message is persisted to the session log at the moment it is
+    /// actually incorporated.
+    UserMessageSeen {
         text: String,
     },
     Finished {

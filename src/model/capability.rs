@@ -113,12 +113,16 @@ impl OptionSpec {
             OptionKind::Enum { values } => {
                 format!("{}=<{}>", self.name, values.join("|"))
             }
+            OptionKind::Map => {
+                format!("{}={{\"Name\": \"value\", ...}}", self.name)
+            }
         }
     }
 }
 
 /// Allowed value shape for one option. Constraints (enum values, numeric
-/// ranges) are enforced by the ExecutionPolicy before any provider runs.
+/// ranges, map key/value rules) are enforced by the ExecutionPolicy before
+/// any provider runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OptionKind {
@@ -126,6 +130,11 @@ pub enum OptionKind {
     Number { min: Option<f64>, max: Option<f64> },
     Bool,
     Enum { values: Vec<String> },
+    /// Object of string pairs, e.g. HTTP headers
+    /// (`{"Authorization": "Bearer x"}`). Keys and values are validated
+    /// by policy (see `validate_http_headers`); values never render into
+    /// shell argv.
+    Map,
 }
 
 /// Dynamic per-capability snapshot computed from tool statuses.

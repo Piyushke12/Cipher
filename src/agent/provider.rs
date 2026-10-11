@@ -141,6 +141,21 @@ pub trait CapabilityProvider: Send + Sync {
     /// run it through the executor. Trusted runtime code: the model never
     /// constructs argv.
     fn execute(&self, request: &CapabilityRequest, ctx: &ExecutionContext) -> ToolResult;
+
+    /// Same as [`Self::execute`], but the provider first reports its exact
+    /// invocation through `trace` (tag, one-line msg, redacted JSON data).
+    /// Default impl skips the report so third-party/test providers keep
+    /// compiling; the runtime always calls this method. Object-safe:
+    /// `&mut dyn FnMut` behind the reference is still dispatchable.
+    fn execute_traced(
+        &self,
+        request: &CapabilityRequest,
+        ctx: &ExecutionContext,
+        trace: &mut dyn FnMut(&str, String, serde_json::Value),
+    ) -> ToolResult {
+        let _ = trace;
+        self.execute(request, ctx)
+    }
 }
 
 /// Tools that operate on local filesystem paths (or local images) and
@@ -248,6 +263,14 @@ impl ProcessProvider {
                 }
                 OptionValue::Num(n) => format_option_number(*n),
                 OptionValue::Bool(b) => b.to_string(),
+                // Structured values never render into shell argv: no
+                // process provider binds a Map option today (the HTTP
+                // provider consumes header maps directly). Reject loudly
+                // rather than stringifying secrets into a command line.
+                OptionValue::Map(_) => Err(format!(
+                    "provider `{}` cannot translate structured option `{name}` into argv",
+                    self.def.id
+                ))?,
             };
             if binding.joined {
                 args.push(format!("{}{}", binding.flag, rendered));
@@ -303,49 +326,9 @@ impl CapabilityProvider for ProcessProvider {
     }
 
     fn execute(&self, request: &CapabilityRequest, ctx: &ExecutionContext) -> ToolResult {
-        // Defense in depth: selection checked availability, but re-verify
-        // at the execution boundary so a stale environment cannot spawn
-        // an uninstalled executable.
-        let status: &ToolStatus = match ctx.env.tools.get(&self.def.id) {
-            Some(s) if s.installed && s.healthy => s,
-            _ => {
-                return ToolResult::error(
-                    &self.def.id,
-                    &request.capability,
-                    &request.target,
-                    format!("provider `{}` is not installed or not healthy", self.def.id),
-                );
-            }
-        };
-        // Target-kind guard: filesystem-only tools reject URL/host targets
-        // before any process is spawned. Non-retryable — the same request
-        // would fail identically.
-        if FS_ONLY_TOOLS.contains(&self.def.id.as_str()) {
-            if let Some(reason) = fs_target_reject_reason(&self.def.id, &request.target) {
-                return ToolResult::error_non_retryable(
-                    &self.def.id,
-                    &request.capability,
-                    &request.target,
-                    reason,
-                );
-            }
-        }
-        let exe = match &status.executable_path {
-            Some(p) => p.clone(),
-            None => {
-                return ToolResult::error(
-                    &self.def.id,
-                    &request.capability,
-                    &request.target,
-                    format!("no executable path resolved for `{}`", self.def.id),
-                );
-            }
-        };
-        let args = match self.translate(request) {
-            Ok(a) => a,
-            Err(e) => {
-                return ToolResult::error(&self.def.id, &request.capability, &request.target, e);
-            }
+        let (exe, args) = match self.prepare(request, ctx) {
+            Ok(pair) => pair,
+            Err(early) => return early,
         };
         let out = ctx.executor.run(&exe, &args, self.timeout);
         ToolResult {
@@ -358,6 +341,93 @@ impl CapabilityProvider for ProcessProvider {
             timed_out: out.timed_out,
             error: out.error,
         }
+    }
+
+    fn execute_traced(
+        &self,
+        request: &CapabilityRequest,
+        ctx: &ExecutionContext,
+        trace: &mut dyn FnMut(&str, String, serde_json::Value),
+    ) -> ToolResult {
+        // Resolve exe + argv without spawning: the exact invocation the
+        // run below will use. Values are scrubbed at the trace sink.
+        if let Ok((exe, args)) = self.prepare(request, ctx) {
+            let head: String = args.join(" ").chars().take(160).collect();
+            trace(
+                crate::infra::trace::tag::TOOL_ARGV,
+                format!("{exe} {head}"),
+                serde_json::json!({
+                    "provider": self.def.id,
+                    "capability": request.capability,
+                    "exe": exe,
+                    "argv": args,
+                    "timeout_secs": self.timeout.as_secs(),
+                }),
+            );
+        }
+        self.execute(request, ctx)
+    }
+}
+
+impl ProcessProvider {
+    /// Pre-spawn resolution shared by `execute`: health re-check, FS
+    /// guard, exe lookup, option translation. `Err(ToolResult)` carries
+    /// the early-out failure (never spawns).
+    fn prepare(
+        &self,
+        request: &CapabilityRequest,
+        ctx: &ExecutionContext,
+    ) -> Result<(String, Vec<String>), ToolResult> {
+        // Defense in depth: selection checked availability, but re-verify
+        // at the execution boundary so a stale environment cannot spawn
+        // an uninstalled executable.
+        let status: &ToolStatus = match ctx.env.tools.get(&self.def.id) {
+            Some(s) if s.installed && s.healthy => s,
+            _ => {
+                return Err(ToolResult::error(
+                    &self.def.id,
+                    &request.capability,
+                    &request.target,
+                    format!("provider `{}` is not installed or not healthy", self.def.id),
+                ));
+            }
+        };
+        // Target-kind guard: filesystem-only tools reject URL/host targets
+        // before any process is spawned. Non-retryable — the same request
+        // would fail identically.
+        if FS_ONLY_TOOLS.contains(&self.def.id.as_str()) {
+            if let Some(reason) = fs_target_reject_reason(&self.def.id, &request.target) {
+                return Err(ToolResult::error_non_retryable(
+                    &self.def.id,
+                    &request.capability,
+                    &request.target,
+                    reason,
+                ));
+            }
+        }
+        let exe = match &status.executable_path {
+            Some(p) => p.clone(),
+            None => {
+                return Err(ToolResult::error(
+                    &self.def.id,
+                    &request.capability,
+                    &request.target,
+                    format!("no executable path resolved for `{}`", self.def.id),
+                ));
+            }
+        };
+        let args = match self.translate(request) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(ToolResult::error(
+                    &self.def.id,
+                    &request.capability,
+                    &request.target,
+                    e,
+                ));
+            }
+        };
+        Ok((exe, args))
     }
 }
 

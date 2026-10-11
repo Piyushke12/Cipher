@@ -420,7 +420,7 @@ fn looks_like_host(t: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
 }
 
-const CHAT_SYSTEM: &str = "You are Medusa, a security assessment assistant inside a terminal UI. \
+const CHAT_SYSTEM: &str = "You are Cipher, a security assessment assistant inside a terminal UI. \
 Be helpful and concise (this is a terminal, not a web page). You know the user's environment capabilities \
 (they are listed in the conversation context). If the user asks you to assess/scan something, briefly say what \
 you can do and ask them to confirm the target — do NOT pretend to run tools. Never emit shell commands.";
@@ -457,6 +457,10 @@ struct InvestigationDone {
     actions: Vec<(String, String)>,
 
     finish: String,
+    /// Pre-rendered authoritative assessment panel (families, findings,
+    /// attack path, identity, unknowns, completion) built in the worker
+    /// from runtime state.
+    assessment_text: String,
 }
 
 /// Chat session state. With inline printing the terminal's scrollback IS
@@ -491,6 +495,14 @@ struct App {
     approval_dialog: Option<ApprovalDialog>,
     /// Last assessed target for `continue`/`resume` resume handling.
     last_target: Option<String>,
+    /// Live assessment panel state (families, graph, completion) updated
+    /// from the event stream; `/status` renders it on demand.
+    panel_families: Vec<(String, String)>,
+    panel_graph: Option<(usize, usize, Vec<String>)>,
+    panel_completion: Option<(bool, String, usize)>,
+    panel_findings: Vec<(usize, String, String)>,
+    /// Full authoritative panel from the last finished investigation.
+    last_assessment_text: Option<String>,
     /// Shared flag that the runtime's ExecutionPolicy checks for Destructive approval.
     approval_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -520,6 +532,11 @@ impl App {
             error_ack: None,
             approval_dialog: None,
             last_target: None,
+            panel_families: Vec::new(),
+            panel_graph: None,
+            panel_completion: None,
+            panel_findings: Vec::new(),
+            last_assessment_text: None,
             approval_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -622,6 +639,9 @@ impl App {
             AgentEvent::Narrated { text } => {
                 self.push(Role::Agent, text.clone());
             }
+            AgentEvent::UserMessageSeen { text } => {
+                self.push(Role::User, text.clone());
+            }
             AgentEvent::CapabilityRequested {
                 capability,
                 target,
@@ -707,6 +727,7 @@ impl App {
                 status,
                 ..
             } => {
+                self.panel_findings.push((*id, status.clone(), title.clone()));
                 self.push(
                     Role::Step,
                     format!("◆ F{id} [{severity}/{status}] {title} ({target})"),
@@ -748,6 +769,33 @@ impl App {
             }
             AgentEvent::VaultRecalled { key } => {
                 self.push(Role::Step, format!("vault: recalled {key}"));
+            }
+            AgentEvent::HypothesisCreated { statement, family } => {
+                self.push(Role::Step, format!("◈ hypothesis [{family}]: {statement}"));
+            }
+            AgentEvent::FindingUpdated { id, stage, note } => {
+                self.panel_findings.push((*id, stage.clone(), note.clone()));
+                self.push(Role::Step, format!("◆ finding {id} -> {stage}: {note}"));
+            }
+            AgentEvent::AttackGraphUpdated { nodes, edges, newly_reachable } => {
+                self.panel_graph = Some((*nodes, *edges, newly_reachable.clone()));
+                let extra = if newly_reachable.is_empty() { String::new() } else { format!("; new: {}", newly_reachable.join(", ")) };
+                self.push(Role::Step, format!("attack graph: {nodes} nodes / {edges} edges{extra}"));
+            }
+            AgentEvent::SecurityTestProgressUpdated { family, status } => {
+                if let Some(slot) = self.panel_families.iter_mut().find(|(f, _)| f == family) {
+                    slot.1 = status.clone();
+                } else {
+                    self.panel_families.push((family.clone(), status.clone()));
+                }
+                self.push(Role::Step, format!("family {family}: {status}"));
+            }
+            AgentEvent::CompletionEvaluated { allowed, reason, remaining } => {
+                self.panel_completion = Some((*allowed, reason.clone(), *remaining));
+                self.push(Role::Step, format!("completion: {} ({reason}, {remaining} remaining)", if *allowed { "allowed" } else { "rejected" }));
+            }
+            AgentEvent::ActionBlocked { reason } => {
+                self.push(Role::Error, format!("blocked: {reason}"));
             }
         }
     }
@@ -1178,15 +1226,17 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                             app.approval_flag
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             let summary = format!(
-                                "Investigation complete - {} steps, {} planned actions.\n{}",
+                                "Investigation complete - {} steps, {} planned actions.\n{}\n{}",
                                 done.steps,
                                 done.actions.len(),
-                                done.finish
+                                done.finish,
+                                done.assessment_text
                             );
                             // Persist to chat history so follow-up "did you find anything?" has context.
                             // Without this, `handle_input` history (6 turns) had no investigation evidence
                             // and the model replied "I haven't run anything" despite 11 steps just executed.
                             push_history(&mut app, "medusa", &summary);
+                            app.last_assessment_text = Some(done.assessment_text.clone());
                             // Also persist a compact transcript of recent steps/observations so the next
                             // chat turn can answer with specifics (ports, HTTP status, etc.) instead of generic.
                             let transcript: String = app
@@ -1396,8 +1446,9 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                                         &state_snap,
                                                     )
                                                     .with_handle(handle)
-                                                    .with_approval_flag(approval);
-                                                    let res = rt.investigate_with(
+                                                    .with_approval_flag(approval)
+                                                    .with_tracer(super::assess::cli_tracer("tui").1);
+                                                    let (res, assessment) = rt.investigate_with_state(
                                                         Target::new(&target),
                                                         &mut |ev| {
                                                             let _ = txc.send(WorkerMsg::Event(ev));
@@ -1416,6 +1467,10 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                                             })
                                                             .collect(),
                                                         finish: finish_summary(&res.finish_reason),
+                                                        assessment_text:
+                                                            super::assess::assessment_summary_text(
+                                                                &assessment,
+                                                            ),
                                                     };
                                                     let _ = txc.send(WorkerMsg::Investigated(done));
                                                 });
@@ -1606,8 +1661,9 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                             let rt =
                                                 AgentRuntime::new(model, tools, caps, &state_snap)
                                                     .with_handle(handle)
-                                                    .with_approval_flag(approval);
-                                            let res = rt.investigate_with(
+                                                    .with_approval_flag(approval)
+                                                    .with_tracer(super::assess::cli_tracer("tui").1);
+                                            let (res, assessment) = rt.investigate_with_state(
                                                 Target::new(&target),
                                                 &mut |ev| {
                                                     let _ = txc.send(WorkerMsg::Event(ev));
@@ -1623,6 +1679,10 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                                     })
                                                     .collect(),
                                                 finish: finish_summary(&res.finish_reason),
+                                                assessment_text:
+                                                    super::assess::assessment_summary_text(
+                                                        &assessment,
+                                                    ),
                                             };
                                             let _ = txc.send(WorkerMsg::Investigated(done));
                                         }
@@ -1641,9 +1701,10 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                     s.spawn(move || {
                                         let rt = AgentRuntime::new(model, tools, caps, &state_snap)
                                             .with_handle(handle)
-                                            .with_approval_flag(approval);
-                                        let res =
-                                            rt.investigate_with(Target::new(&address), &mut |ev| {
+                                            .with_approval_flag(approval)
+                                            .with_tracer(super::assess::cli_tracer("tui").1);
+                                        let (res, assessment) =
+                                            rt.investigate_with_state(Target::new(&address), &mut |ev| {
                                                 let _ = txc.send(WorkerMsg::Event(ev));
                                             });
                                         let done = InvestigationDone {
@@ -1654,6 +1715,8 @@ pub fn run_chat_tui(state: &mut EnvironmentState, tools: &ToolRegistry, caps: &C
                                                 .map(|a| (a.capability.clone(), a.provider.clone()))
                                                 .collect(),
                                             finish: finish_summary(&res.finish_reason),
+                                            assessment_text:
+                                                super::assess::assessment_summary_text(&assessment),
                                         };
                                         let _ = txc.send(WorkerMsg::Investigated(done));
                                     });
@@ -1938,6 +2001,11 @@ fn handle_slash(
     tools: &ToolRegistry,
     caps: &CapabilityRegistry,
 ) -> Action {
+    if text.trim() == "/status" || text.trim().starts_with("/status ") {
+        app.push(Role::Agent, status_text(app));
+        push_history(app, "medusa", "(status)");
+        return Action::None;
+    }
     let cmd = Command::parse(text);
     match cmd {
         Command::Assess(target) => Action::Assess(target),
@@ -1977,8 +2045,55 @@ fn handle_slash(
     }
 }
 
-fn finish_summary(reason: &crate::agent::FinishReason) -> String {
-    use crate::agent::FinishReason as F;
+/// Live assessment panel for `/status`: families, findings, attack graph,
+/// completion — all derived from tracked runtime state, never hardcoded.
+fn status_text(app: &App) -> String {
+    let mut out = String::from("Assessment status");
+    if let Some(t) = &app.last_target {
+        out.push_str(&format!(" — {t}"));
+    }
+    out.push_str("\n\nVulnerability Families\n");
+    if app.panel_families.is_empty() {
+        out.push_str("  (no progress events yet)\n");
+    }
+    for (fam, status) in &app.panel_families {
+        out.push_str(&format!("  {fam}: {status}\n"));
+    }
+    out.push_str("\nFindings\n");
+    if app.panel_findings.is_empty() {
+        out.push_str("  (none reported)\n");
+    }
+    for (id, stage, title) in &app.panel_findings {
+        out.push_str(&format!("  ◆ finding {id} [{stage}] {title}\n"));
+    }
+    out.push_str("\nAttack Path\n");
+    match &app.panel_graph {
+        Some((nodes, edges, fresh)) => {
+            out.push_str(&format!("  graph: {nodes} nodes / {edges} edges\n"));
+            if !fresh.is_empty() {
+                out.push_str(&format!("  newly reachable: {}\n", fresh.join(", ")));
+            }
+        }
+        None => out.push_str("  (no attack graph updates yet)\n"),
+    }
+    out.push_str("\nCompletion\n");
+    match &app.panel_completion {
+        Some((allowed, reason, remaining)) => {
+            out.push_str(&format!(
+                "  {} ({reason}, {remaining} remaining)\n",
+                if *allowed { "allowed" } else { "rejected" }
+            ));
+        }
+        None => out.push_str("  (no completion evaluation yet)\n"),
+    }
+    if let Some(full) = &app.last_assessment_text {
+        out.push_str("\nLast finished assessment:\n");
+        out.push_str(full);
+    }
+    out
+}
+
+fn finish_summary(reason: &crate::agent::FinishReason) -> String {    use crate::agent::FinishReason as F;
     match reason {
         F::ModelFinished(r) => r.clone(),
         F::MaxSteps(n) => format!("stopped after {n} steps"),

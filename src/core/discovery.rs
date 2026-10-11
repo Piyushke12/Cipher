@@ -439,4 +439,30 @@ mod tests {
         assert_eq!(absent.status, crate::model::CapabilityStatus::NotAvailable);
         assert!(absent.providers_total.is_empty());
     }
+
+    #[test]
+    fn builtin_internal_providers_are_covered_from_the_registry() {
+        // The internal providers ship as builtin tool defs (medusa-http,
+        // medusa-research), so a real scan marks their capabilities
+        // covered with no external binary. Regression guard for web.research
+        // (and http.request / api.*) showing "Not available".
+        let tools = crate::registry::ToolRegistry::builtin();
+        let caps = CapabilityRegistry::builtin();
+        let svc = ToolDiscoveryService::new(&crate::infra::runner::RealCommandRunner);
+        let statuses = svc.discover_all(tools.all());
+        let tools_by_id: HashMap<String, ToolDefinition> = tools
+            .all()
+            .iter()
+            .map(|t| (t.id.clone(), t.clone()))
+            .collect();
+        let snaps = derive_capabilities(&statuses, &tools_by_id, &caps);
+        for id in ["web.research", "http.request", "api.auth_testing", "api.bola_testing"] {
+            let snap = snaps.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(
+                snap.status,
+                crate::model::CapabilityStatus::Covered,
+                "{id} must be covered by its builtin internal provider"
+            );
+        }
+    }
 }

@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 
-use medusa_lib::agent::{AgentRuntime, AgentSession, RuntimeHandle};
+use medusa_lib::agent::{AgentRuntime, AgentSession, ModelProvider, RuntimeHandle};
 use medusa_lib::core::discovery::scan_environment;
 use medusa_lib::infra::runner::RealCommandRunner;
 use medusa_lib::infra::sessions::{SessionRecord, SessionSummary, SessionWriter, TimedRecord};
@@ -20,8 +20,11 @@ const ENV_TTL_SECS: i64 = 6 * 60 * 60;
 
 /// Messages a session worker accepts, in order.
 enum WorkerMsg {
-    /// A user chat message: runs one full agent turn.
-    User(String),
+    /// Wake the worker to drain the shared `pending_input` queue. User
+    /// chat text travels in that queue, not in this message — a poke
+    /// carries no payload. While a turn runs, further pokes are harmless:
+    /// the running turn drains new input mid-flight (see `spawn_worker`).
+    Poke,
     /// Swap the model provider (desktop provider switch): the worker
     /// rebuilds its model from the persisted config; takes effect from
     /// this session's NEXT turn.
@@ -29,6 +32,9 @@ enum WorkerMsg {
     /// Manual compaction ("Compact now" button): summarize older turns
     /// immediately, same path as auto-compaction.
     CompactNow,
+    /// Sidebar rename: append a `Rename` record through the worker's own
+    /// writer, since it holds the only open handle to the session file.
+    Rename(String),
 }
 
 pub struct SessionWorker {
@@ -43,10 +49,28 @@ pub struct SessionWorker {
     /// True while a turn is executing (surfaced on session switch so the
     /// UI can restore the "running" state of a background session).
     busy: Arc<AtomicBool>,
+    /// User messages sent but not yet incorporated. Incremented on send,
+    /// decremented when the message is pulled from `pending_input` — at
+    /// turn start if idle, or mid-turn when the running turn folds it in.
+    /// Lets the UI show "queued — Cipher hasn't seen this yet".
+    queued: Arc<AtomicUsize>,
+    /// User chat text waiting to be incorporated. `send_message` pushes
+    /// here then pokes; the worker pulls from the front to start a turn,
+    /// and the running turn drains the rest mid-flight so a message sent
+    /// mid-turn is folded into the SAME turn instead of stopping it.
+    pending_input: Arc<Mutex<VecDeque<String>>>,
+    /// Debug-trace writer for this session (`<sid>.trace.jsonl`).
+    /// Shared with the runtime tracer closure and the cancel path.
+    trace: Arc<Mutex<medusa_lib::infra::trace::TraceWriter>>,
     /// Set when the worker thread exits (seen by `delete_session`, which
     /// must wait for the thread to release the session file — Windows
     /// refuses to delete a file with an open handle).
     exited: Arc<AtomicBool>,
+    /// Raised by `set_provider` when the operator switches models. The
+    /// running turn's drive loop consumes it at the next step boundary and
+    /// rebinds the model BEFORE the next LLM call, so a switch takes effect
+    /// mid-turn (next step) instead of only when the turn ends.
+    swap_pending: Arc<AtomicBool>,
 }
 
 /// Shared app state: the worker registry, the session the UI is watching
@@ -186,6 +210,9 @@ fn persist_event(
             user_time: turn_user_at,
         },
         AgentEvent::Narrated { text } => SessionRecord::Note { text: text.clone() },
+        // A mid-turn message folded into the running turn: persist it as a
+        // user record so a background/replayed transcript keeps the bubble.
+        AgentEvent::UserMessageSeen { text } => SessionRecord::User { text: text.clone() },
         AgentEvent::ScopeGranted { target } => SessionRecord::Target {
             target: target.clone(),
         },
@@ -269,6 +296,9 @@ fn persist_event(
             limit_tokens,
             pct,
             estimated,
+            // Ephemeral telemetry: meaningful live, meaningless on
+            // replay — not persisted to the session record.
+            cached_tokens: _,
         } => SessionRecord::CtxUsage {
             used: *used_tokens,
             limit: *limit_tokens,
@@ -296,6 +326,32 @@ fn persist_event(
             key: key.clone(),
             kind: String::new(),
         },
+        AgentEvent::HypothesisCreated { statement, family } => SessionRecord::Think {
+            text: format!("hypothesis [{family}]: {statement}"),
+        },
+        AgentEvent::FindingUpdated { id, stage, note } => SessionRecord::Think {
+            text: format!("finding {id} -> {stage}: {note}"),
+        },
+        AgentEvent::AttackGraphUpdated { nodes, edges, newly_reachable } => {
+            SessionRecord::Think {
+                text: format!(
+                    "attack graph: {nodes} nodes / {edges} edges; new: {}",
+                    newly_reachable.join(", ")
+                ),
+            }
+        }
+        AgentEvent::SecurityTestProgressUpdated { family, status } => SessionRecord::Think {
+            text: format!("family {family}: {status}"),
+        },
+        AgentEvent::CompletionEvaluated { allowed, reason, remaining } => SessionRecord::Think {
+            text: format!(
+                "completion {}: {reason} ({remaining} remaining)",
+                if *allowed { "allowed" } else { "rejected" }
+            ),
+        },
+        AgentEvent::ActionBlocked { reason } => SessionRecord::Think {
+            text: format!("blocked: {reason}"),
+        },
         _ => return, // lifecycle/status events are not replayed
     };
     let _ = writer.append(record);
@@ -314,6 +370,7 @@ fn emit_event(app: &tauri::AppHandle, session_id: &str, ev: &medusa_lib::agent::
             "summary": match ev {
                 AgentEvent::Reply { text } => text.clone(),
                 AgentEvent::Narrated { text } => text.clone(),
+                AgentEvent::UserMessageSeen { text } => text.clone(),
                 AgentEvent::ScopeGranted { target } => format!("Scope: {target}"),
                 AgentEvent::ObservationAdded { summary } => summary.clone(),
                 AgentEvent::ToolExecuted { tool_id, success, timed_out, exit_code, .. } => format!("{} {} (exit {})", tool_id, if *timed_out { "timed out" } else if *success { "ok" } else { "failed" }, exit_code),
@@ -335,6 +392,12 @@ fn emit_event(app: &tauri::AppHandle, session_id: &str, ev: &medusa_lib::agent::
                 AgentEvent::Compacted { before_tokens, after_tokens, freed_tokens, fallback } => format!("compacted{}: {before_tokens} → {after_tokens} (freed {freed_tokens})", if *fallback { " (fallback)" } else { "" }),
                 AgentEvent::VaultStored { key, kind, refreshed } => format!("vault: {key} [{kind}] {}", if *refreshed { "refreshed" } else { "stored" }),
                 AgentEvent::VaultRecalled { key } => format!("vault: recalled {key}"),
+                AgentEvent::HypothesisCreated { statement, family } => format!("hypothesis [{family}]: {statement}"),
+                AgentEvent::FindingUpdated { id, stage, note } => format!("finding {id} -> {stage}: {note}"),
+                AgentEvent::AttackGraphUpdated { nodes, edges, .. } => format!("attack graph: {nodes} nodes / {edges} edges"),
+                AgentEvent::SecurityTestProgressUpdated { family, status } => format!("{family}: {status}"),
+                AgentEvent::CompletionEvaluated { allowed, reason, remaining } => format!("completion {}: {reason} ({remaining})", if *allowed { "allowed" } else { "rejected" }),
+                AgentEvent::ActionBlocked { reason } => format!("blocked: {reason}"),
             },
             "capability": match ev {
                 AgentEvent::CapabilityRequested { capability, .. } => Some(capability.clone()),
@@ -359,11 +422,12 @@ fn emit_event(app: &tauri::AppHandle, session_id: &str, ev: &medusa_lib::agent::
                 _ => None,
             },
             "ctx": match ev {
-                AgentEvent::ContextUsage { used_tokens, limit_tokens, pct, estimated } => Some(serde_json::json!({
+                AgentEvent::ContextUsage { used_tokens, limit_tokens, pct, estimated, cached_tokens } => Some(serde_json::json!({
                     "used": used_tokens,
                     "limit": limit_tokens,
                     "pct": pct,
                     "estimated": estimated,
+                    "cached": cached_tokens,
                 })),
                 _ => None,
             },
@@ -419,13 +483,42 @@ fn spawn_worker(
     let gate: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let busy = Arc::new(AtomicBool::new(false));
     let exited = Arc::new(AtomicBool::new(false));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let swap_pending = Arc::new(AtomicBool::new(false));
+    let pending_input: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Debug trace for this session. Best-effort: a full disk must never
+    // prevent the session from starting — fall back to a temp file.
+    let trace = Arc::new(Mutex::new(
+        medusa_lib::infra::trace::TraceWriter::open(&session_id).unwrap_or_else(|_| {
+            let dir = std::env::temp_dir();
+            medusa_lib::infra::trace::TraceWriter::open_in(
+                &dir,
+                &format!("trace-fallback-{session_id}"),
+            )
+            .expect("temp trace writer")
+        }),
+    ));
+    {
+        use medusa_lib::infra::trace::{tag, TraceEntry};
+        trace.lock().unwrap().append(&TraceEntry::new(
+            0,
+            "",
+            tag::SESSION_WORKER_START,
+            format!("worker started for session {session_id}"),
+            serde_json::json!({"session": session_id}),
+        ));
+    }
     let worker = SessionWorker {
         tx: tx.clone(),
         handle: handle.clone(),
         approval: Arc::clone(&approval),
         gate: Arc::clone(&gate),
         busy: Arc::clone(&busy),
+        queued: Arc::clone(&queued),
+        pending_input: Arc::clone(&pending_input),
+        trace: Arc::clone(&trace),
         exited: Arc::clone(&exited),
+        swap_pending: Arc::clone(&swap_pending),
     };
     let sid = session_id;
     let app = app;
@@ -442,7 +535,10 @@ fn spawn_worker(
         // Registries live inside the thread so references outlive the runtime.
         let tools = ToolRegistry::builtin();
         let caps = CapabilityRegistry::builtin();
-        let (model, _) = medusa_lib::cli::assess::select_model(&env);
+        let (mut model, _) = medusa_lib::cli::assess::select_model(&env);
+        // Sticky cache affinity: this worker's turns route together on
+        // gateways that shard caches by client.
+        model.set_session_key(sid.clone());
         let file_cfg = medusa_lib::infra::config::load_file_config();
         let ctx_cfg = medusa_lib::infra::config::resolve_context_settings(&file_cfg, &|k| {
             std::env::var(k).ok()
@@ -453,15 +549,84 @@ fn spawn_worker(
             .with_approval_gate(gate)
             .with_context_window(ctx_cfg.context_tokens)
             .with_compaction_threshold(ctx_cfg.compaction_threshold_pct)
-            .with_compact_keep_turns(ctx_cfg.compact_keep_turns);
-        let mut sess: AgentSession<'_, '_> = rt.session();
-        // Reopened session (worker spawned after a restart): replay the
-        // persisted records so the model regains scope, conversation, and
-        // observations. New sessions load an empty/header-only file - a
-        // no-op.
-        if let Ok(records) = medusa_lib::infra::sessions::load_session(&sid) {
-            sess.rehydrate(&records);
-        }
+            .with_compact_keep_turns(ctx_cfg.compact_keep_turns)
+            .with_tracer({
+                let trace = Arc::clone(&trace);
+                move |entry: medusa_lib::infra::trace::TraceEntry| {
+                    trace.lock().unwrap().append(&entry);
+                }
+            })
+            // At each step boundary the running turn pulls any messages
+            // that arrived mid-turn and folds them into the SAME turn
+            // (conversation + scope) instead of stopping. Each pulled
+            // message clears one `queued` slot — the turn-starting message
+            // is already accounted for by the worker loop below.
+            .with_input_drain({
+                let pending_input = Arc::clone(&pending_input);
+                let queued = Arc::clone(&queued);
+                move || {
+                    let drained: Vec<String> =
+                        pending_input.lock().unwrap().drain(..).collect();
+                    for _ in &drained {
+                        let _ = queued.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                            |n| n.checked_sub(1),
+                        );
+                    }
+                    drained
+                }
+            })
+            // At each step boundary the running turn checks whether the
+            // operator switched providers (set_provider raises swap_pending)
+            // and, if so, rebuilds the model from the freshly-saved config
+            // BEFORE the next LLM call — so a mid-turn switch takes effect on
+            // the next step instead of only when the long turn finally ends.
+            .with_model_reload({
+                let swap_pending = Arc::clone(&swap_pending);
+                let env = env.clone();
+                let sid_for_reload = sid.clone();
+                move || {
+                    if swap_pending.swap(false, Ordering::SeqCst) {
+                        let (mut model, _) = medusa_lib::cli::assess::select_model(&env);
+                        model.set_session_key(sid_for_reload.clone());
+                        Some(model)
+                    } else {
+                        None
+                    }
+                }
+            });
+        // Reopened session (worker spawned after a restart): prefer the
+        // full (assessment + ContextManager) snapshot pair written by
+        // `persist_best_effort` — it carries the attack graph, target
+        // model, family progress, prior actions (with their reason and
+        // effectiveness), raw tool evidence, and the error history, none
+        // of which the session log's record-by-record replay below can
+        // reconstruct (it has no record kind for actions or evidence at
+        // all). Fall back to log replay only for a session that never
+        // got far enough to snapshot, or one saved before this existed.
+        let snapshot = medusa_lib::agent::assessment::load(&sid)
+            .and_then(|a| medusa_lib::agent::context::load(&sid).map(|cm| (a, cm)));
+        let log_records = medusa_lib::infra::sessions::load_session(&sid).ok();
+        let mut sess: AgentSession<'_, '_> = match snapshot {
+            Ok((assessment, cm)) => {
+                let mut sess = rt.resume_session_with_context(assessment, cm);
+                // Backstop for a snapshot saved before scope syncing
+                // existed: restore_scope_from_log is a no-op once scope
+                // is already present, so this never duplicates a grant.
+                if let Some(records) = &log_records {
+                    sess.restore_scope_from_log(records);
+                }
+                sess
+            }
+            Err(_) => {
+                let mut sess = rt.session_with_id(&sid);
+                if let Some(records) = &log_records {
+                    sess.rehydrate(records);
+                }
+                sess
+            }
+        };
         // Drain the mailbox in order; dropping the sender closes the loop.
         while let Ok(message) = rx.recv() {
             match message {
@@ -469,30 +634,58 @@ fn spawn_worker(
                     // Provider switch: rebuild from the persisted config.
                     // The session's context, scope, and world model are
                     // untouched — only the brain changes.
-                    let (model, _) = medusa_lib::cli::assess::select_model(&env);
+        let (mut model, _) = medusa_lib::cli::assess::select_model(&env);
+        // Sticky cache affinity: this worker's turns route together on
+        // gateways that shard caches by client.
+        model.set_session_key(sid.clone());
                     rt.swap_model(model);
                 }
-                WorkerMsg::User(message) => {
-                    busy.store(true, Ordering::SeqCst);
-                    let sid = sid.clone();
-                    let turn_user = message.clone();
-                    // When this user message arrived — preserved on the Chat
-                    // record so replay keeps the user bubble at send time.
-                    let turn_user_at = medusa_lib::infra::sessions::now_ms();
-                    // Persist the message itself immediately: a turn that never
-                    // completes (Stop, crash, model failures) must not lose the
-                    // user's words from the transcript.
-                    let _ = writer.append(medusa_lib::infra::sessions::SessionRecord::User {
-                        text: message.clone(),
-                    });
-                    sess.run_turn(&message, &mut |ev: medusa_lib::agent::AgentEvent| {
-                        persist_event(&mut writer, &ev, &turn_user, turn_user_at);
-                        let is_active = *active.lock().unwrap() == Some(sid.clone());
-                        if is_active {
-                            emit_event(&app, &sid, &ev);
+                WorkerMsg::Poke => {
+                    // Start a turn for the oldest waiting message. Any
+                    // messages that arrive while this turn runs are folded
+                    // into it mid-flight by the input_drain hook above, so
+                    // the buffer is normally empty when run_turn returns;
+                    // the `while` only loops for a message that landed in
+                    // the gap between the last drain and the turn ending.
+                    loop {
+                        let Some(message) = pending_input.lock().unwrap().pop_front() else {
+                            break;
+                        };
+                        // Pulled from the queue: no longer "waiting unseen".
+                        let _ = queued.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                            n.checked_sub(1)
+                        });
+                        {
+                            use medusa_lib::infra::trace::{tag, TraceEntry};
+                            trace.lock().unwrap().append(&TraceEntry::new(
+                                0,
+                                "",
+                                tag::SESSION_TURN_START,
+                                format!("turn started (message {} chars)", message.chars().count()),
+                                serde_json::json!({ "message_len": message.chars().count() }),
+                            ));
                         }
-                    });
-                    busy.store(false, Ordering::SeqCst);
+                        busy.store(true, Ordering::SeqCst);
+                        let sid = sid.clone();
+                        let turn_user = message.clone();
+                        // When this user message arrived — preserved on the Chat
+                        // record so replay keeps the user bubble at send time.
+                        let turn_user_at = medusa_lib::infra::sessions::now_ms();
+                        // Persist the message itself immediately: a turn that never
+                        // completes (Stop, crash, model failures) must not lose the
+                        // user's words from the transcript.
+                        let _ = writer.append(medusa_lib::infra::sessions::SessionRecord::User {
+                            text: message.clone(),
+                        });
+                        sess.run_turn(&message, &mut |ev: medusa_lib::agent::AgentEvent| {
+                            persist_event(&mut writer, &ev, &turn_user, turn_user_at);
+                            let is_active = *active.lock().unwrap() == Some(sid.clone());
+                            if is_active {
+                                emit_event(&app, &sid, &ev);
+                            }
+                        });
+                        busy.store(false, Ordering::SeqCst);
+                    }
                 }
                 WorkerMsg::CompactNow => {
                     busy.store(true, Ordering::SeqCst);
@@ -505,6 +698,9 @@ fn spawn_worker(
                         }
                     });
                     busy.store(false, Ordering::SeqCst);
+                }
+                WorkerMsg::Rename(title) => {
+                    let _ = writer.append(medusa_lib::infra::sessions::SessionRecord::Rename { title });
                 }
             }
         }
@@ -570,10 +766,60 @@ async fn send_message(
         .lock()
         .unwrap()
         .get(&sid)
-        .map(|w| w.tx.send(WorkerMsg::User(message.clone())))
+        .map(|w| {
+            // Queue the text, then poke. Counted as queued until it is
+            // pulled — at turn start (idle worker) or mid-turn (the
+            // running turn folds it in). The poke only wakes the worker;
+            // a poke that lands mid-turn is harmless (the buffer is
+            // drained by the running turn, and the post-turn loop finds
+            // nothing left). A send failure rolls the queue entry back.
+            w.queued.fetch_add(1, Ordering::SeqCst);
+            w.pending_input.lock().unwrap().push_back(message.clone());
+            {
+                use medusa_lib::infra::trace::{tag, TraceEntry};
+                w.trace.lock().unwrap().append(&TraceEntry::new(
+                    0,
+                    "",
+                    tag::SESSION_MESSAGE_RECEIVED,
+                    format!("message received ({} chars)", message.chars().count()),
+                    serde_json::json!({
+                        "message_len": message.chars().count(),
+                    }),
+                ));
+            }
+            w.tx.send(WorkerMsg::Poke)
+        })
         .transpose()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if let Some(w) = state.workers.lock().unwrap().get(&sid) {
+                // Roll back both the counter and the queued text.
+                let _ = w.queued.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    n.checked_sub(1)
+                });
+                w.pending_input.lock().unwrap().pop_back();
+            }
+            e.to_string()
+        })?;
     Ok(sid)
+}
+
+/// How many sent messages the session worker hasn't picked up yet.
+/// The UI polls this while it shows "queued" bubbles so a message sent
+/// mid-turn visibly transitions queued → seen instead of implying the
+/// agent is already reading it.
+#[tauri::command]
+fn queue_depth(state: State<AppState>, session_id: Option<String>) -> Result<usize, String> {
+    let id = session_id.or_else(|| state.active.lock().unwrap().clone());
+    let Some(id) = id else {
+        return Ok(0);
+    };
+    Ok(state
+        .workers
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|w| w.queued.load(Ordering::SeqCst))
+        .unwrap_or(0))
 }
 
 fn session_exists(id: &str) -> bool {
@@ -625,10 +871,50 @@ fn cancel_assess(state: State<AppState>, session_id: Option<String>) -> Result<S
     let workers = state.workers.lock().unwrap();
     if let Some(w) = workers.get(&id) {
         w.handle.cancel();
+        {
+            use medusa_lib::infra::trace::{tag, TraceEntry};
+            w.trace.lock().unwrap().append(&TraceEntry::new(
+                0,
+                "",
+                tag::SESSION_CANCELLED,
+                "user cancelled the current turn".to_string(),
+                serde_json::json!({}),
+            ));
+        }
         Ok("cancelled".into())
     } else {
         Ok("no active investigation".into())
     }
+}
+
+/// Trace tail for the Trace drawer: last `max_lines` entries plus the
+/// total line count so the UI can show "showing N of M".
+#[derive(Serialize)]
+struct TraceTail {
+    entries: Vec<medusa_lib::infra::trace::TraceEntry>,
+    total: usize,
+    truncated: bool,
+}
+
+#[tauri::command]
+fn get_trace(
+    state: State<AppState>,
+    session_id: Option<String>,
+    max_lines: Option<usize>,
+) -> Result<TraceTail, String> {
+    let dir = medusa_lib::infra::trace::traces_dir();
+    let id = session_id.or_else(|| state.active.lock().unwrap().clone());
+    let Some(id) = id else {
+        return Err("no active session".into());
+    };
+    let max = max_lines.unwrap_or(500).clamp(50, 5000);
+    let (entries, total, truncated) =
+        medusa_lib::infra::trace::TraceWriter::read_tail(&dir, &id, max)?;
+    Ok(TraceTail {
+        entries,
+        total,
+        truncated,
+    })
 }
 
 /// Manually compact a session: summarize older turns now instead of
@@ -818,6 +1104,29 @@ async fn delete_session(state: State<'_, AppState>, id: String) -> Result<String
     Ok("deleted".into())
 }
 
+/// Rename a session from the sidebar. Append-only, like every other
+/// record — routed through the live worker's writer when one exists
+/// (it holds the only open file handle); otherwise opened directly.
+#[tauri::command]
+fn rename_session(state: State<AppState>, id: String, title: String) -> Result<String, String> {
+    if !medusa_lib::infra::sessions::is_valid_id(&id) {
+        return Err("invalid session id".into());
+    }
+    let title: String = title.trim().chars().take(80).collect();
+    if title.is_empty() {
+        return Err("title cannot be empty".into());
+    }
+    let workers = state.workers.lock().unwrap();
+    if let Some(w) = workers.get(&id) {
+        let _ = w.tx.send(WorkerMsg::Rename(title));
+    } else {
+        drop(workers);
+        medusa_lib::infra::sessions::SessionWriter::open(&id)?
+            .append(SessionRecord::Rename { title })?;
+    }
+    Ok("renamed".into())
+}
+
 #[tauri::command]
 async fn refresh_tools(state: State<'_, AppState>) -> Result<DoctorInfo, String> {
     // Drop memory + disk cache so the next env_state call rescans for real.
@@ -894,9 +1203,15 @@ async fn set_provider(
         .map_err(|e| format!("not switching: {e}"))?;
     medusa_lib::infra::set_provider_in_config(sel)?;
     // Live workers swap their model; sessions spawned later read the
-    // updated config at spawn.
+    // updated config at spawn. An IDLE worker swaps immediately via the
+    // mailbox message. A BUSY worker (mid-turn, e.g. blocked on a slow LLM
+    // call) can't process the mailbox until the turn ends, so we also raise
+    // `swap_pending`: its drive loop consumes the flag at the next step
+    // boundary and rebinds the model before the next LLM call — the switch
+    // lands on the next step instead of after the whole turn.
     let workers = state.workers.lock().unwrap();
     for w in workers.values() {
+        w.swap_pending.store(true, Ordering::SeqCst);
         let _ = w.tx.send(WorkerMsg::SwapModel);
     }
     drop(workers);
@@ -905,6 +1220,11 @@ async fn set_provider(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Prune trace files older than 30 days before serving.
+    medusa_lib::infra::trace::TraceWriter::prune_older_than(
+        &medusa_lib::infra::trace::traces_dir(),
+        30,
+    );
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
@@ -915,6 +1235,8 @@ pub fn run() {
             get_capabilities,
             get_capability_details,
             send_message,
+            queue_depth,
+            get_trace,
             set_active_session,
             approve,
             cancel_assess,
@@ -925,7 +1247,8 @@ pub fn run() {
             list_sessions,
             open_session,
             close_session,
-            delete_session
+            delete_session,
+            rename_session
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
