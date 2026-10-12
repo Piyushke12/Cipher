@@ -1,23 +1,22 @@
 # 🛡️ <div align="center">Cipher</div>
 
-Autonomous Security Assessment Agent
-
-<div align="center">
-  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/terminal/terminal-original.svg" alt="Terminal" width="60" height="60"/>
-  <h3>Security · Analysis · Automation</h3>
-</div>
-
-<sup>🤖 An autonomous security agent for authorized penetration testing and vulnerability assessment</sup>
-
----
+<sup>🤖 Autonomous Security Assessment Agent</sup>
 
 <div align="center">
   <a href="https://github.com/tsherif/cipher">
-    <img src="https://raw.githubusercontent.com/tsherif/cipher/main/assets/logo.svg" alt="Cipher Logo" width="120"/>
+    <img src="https://raw.githubusercontent.com/tsherif/cipher/main/assets/logo.svg" alt="Cipher Logo" width="100"/>
   </a>
 </div>
 
+<div align="center">
+  <img src="icons/icon.png" alt="Cipher Icon" width="80" height="80" style="border-radius: 10px; margin-top: 10px;"/>
+</div>
+
+<sup>🔒 Authorized security assessment & penetration testing</sup>
+
 ---
+
+## Description
 
 ## Description
 
