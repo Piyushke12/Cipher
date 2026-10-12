@@ -1,6 +1,6 @@
 <div align="center">
 
-# <img src="desktop/src/assets/avatar.png" width="56" alt="Cipher" /> Cipher
+# <img src="desktop/src/assets/avatar.png" width="54" align="absmiddle" alt="Cipher" /> Cipher
 
 **🛡️ Autonomous Security Assessment Agent**
 
@@ -10,7 +10,7 @@
 
 ---
 
-## Description
+## 📖 Description
 
 **Cipher** is an autonomous security assessment agent designed to conduct authorized security assessments and penetration testing. It operates as an experienced offensive security professional that discovers, investigates, validates, and demonstrates security weaknesses across authorized attack surfaces.
 
@@ -34,49 +34,49 @@ Your goal is not to maximize the number of tools executed, but to determine how 
 
 ---
 
-## Architecture
+## 🏗️ Architecture
 
 Cipher's architecture consists of the following key components:
 
-### Agent Runtime
+### ⚙️ Agent Runtime
 - **Agent Core**: The LLM reasoning engine that proposes actions and decisions
 - **Completeness Engine**: Decides when the assessment is complete
 - **Runtime Controls**: Scope, authorization, policy, risk management, and resource limits
 - **Evidence Capture**: Records all findings, observations, and validated vulnerabilities
 
-### Configuration
+### 🔧 Configuration
 - `CipherConfig`: Configuration struct containing provider settings, model preferences, and execution parameters
 - Provider selection and model configuration
 - Context settings and token limits
 
-### Security Controls
+### 🔒 Security Controls
 - Authorization policies and scope enforcement
 - Risk assessment and validation checks
 - Evidence integrity and tracking
 - Session management via `X-Cipher-Session` headers
 
-### Tool Integration
+### 🔌 Tool Integration
 - Playwright-based browser capabilities
 - Various security scanning tools
 - Research and fetch capabilities
 - User agent identification: `Cipher/0.1 (security-research; contact local-operator)`
 
-### Prompt Caching
+### ⚡ Prompt Caching
 - Designed with append-only transcript architecture
 - Kernel-cached prefix for improved TTFT
 - Deterministic serialization for byte-identical retries
 
 ---
 
-## QuickStart
+## 🚀 QuickStart
 
-### Prerequisites
+### 📋 Prerequisites
 
 - Rust (latest stable)
 - Node.js & npm (for desktop/Tauri components)
 - Git
 
-### Installation
+### 📦 Installation
 
 ```bash
 # Clone the repository
@@ -94,7 +94,7 @@ npm install
 cipher tauri build
 ```
 
-### Running Locally
+### ▶️ Running Locally
 
 ```bash
 # Start the development server
@@ -104,7 +104,7 @@ cipher tauri dev
 cipher assess <target>
 ```
 
-### Configuration
+### 🔧 Configuration
 
 Create a config file or set environment variables for:
 - API keys and provider settings
@@ -113,7 +113,7 @@ Create a config file or set environment variables for:
 
 ---
 
-## Repository Map
+## 🗺️ Repository Map
 
 ```
 Cipher/
@@ -142,9 +142,9 @@ Cipher/
 
 ---
 
-## Contribution Guidelines
+## 🤝 Contribution Guidelines
 
-### How to Contribute
+### 🛠️ How to Contribute
 
 1. **Fork the repository** and create a branch from `main`
 2. **Follow the code style** - Rust code follows idiomatic patterns, TypeScript/React follows standard conventions
@@ -152,21 +152,21 @@ Cipher/
 4. **Update documentation** as needed
 5. **Submit a Pull Request** with a clear description of changes
 
-### Development Workflow
+### 🔄 Development Workflow
 
 - Run `cargo check` to verify Rust code compiles
 - Run `npm run dev` for the desktop UI
 - Follow existing patterns in the codebase
 - Refer to `Base Plan.md` for roadmap and future goals
 
-### Code Standards
+### 📏 Code Standards
 
 - Rust: Use `cargo fmt` and `cargo clippy`
 - TypeScript: Follow existing code style in `desktop/src/`
 - Commit messages: Clear, descriptive subject lines
 - PR titles: Prefix with relevant component (e.g., `[agent]`, `[cli]`, `[infra]`)
 
-### Areas for Contribution
+### 🌱 Areas for Contribution
 
 - New security assessment capabilities
 - Additional tool integrations
