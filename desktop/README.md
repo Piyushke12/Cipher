@@ -1,4 +1,9 @@
-# Cipher — Tauri + React + Typescript
+# 🚀 Cipher — Tauri + React + Typescript
+
+<div align="center">
+  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/react/react-original.svg" alt="React" width="60" height="60"/>
+  <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/rust/rust-original.svg" alt="Rust" width="60" height="60"/>
+</div>
 
 This template should help get you started developing with Tauri, React and Typescript in Vite.
 
