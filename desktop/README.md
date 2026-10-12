@@ -14,7 +14,7 @@
 </div>
 
 <div align="center">
-  <img src="icons/icon.png" alt="Cipher Icon" width="80" height="80" style="border-radius: 10px; margin-top: 10px;"/>
+  <img src="desktop/src-tauri/icons/icon.png" alt="Cipher Icon" width="80" height="80" style="border-radius: 10px; margin-top: 10px;"/>
 </div>
 
 This template should help get you started developing with Tauri, React and Typescript in Vite.
