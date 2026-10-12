@@ -1,4 +1,4 @@
-# 🚀 Cipher — Tauri + React + Typescript
+# 🚀 <div align="center">Cipher — Tauri + React + Typescript</div>
 
 <div align="center">
   <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/react/react-original.svg" alt="React" width="60" height="60"/>

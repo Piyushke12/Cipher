@@ -1,4 +1,4 @@
-# 🛡️ Cipher
+# 🛡️ <div align="center">Cipher</div>
 
 Autonomous Security Assessment Agent
 
