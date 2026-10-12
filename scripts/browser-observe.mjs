@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Medusa browser sidecar: the executable behind the `browser` tool.
+// Cipher browser sidecar: the executable behind the `browser` tool.
 // Loads a page in headless Chromium via Playwright, records network
 // traffic (XHR/fetch/document), and prints one JSON object on stdout:
 //
@@ -65,7 +65,7 @@ const pw = await loadPlaywright().catch((e) => {
 const browser = await pw.chromium.launch({ headless: true });
 try {
   const page = await browser.newPage({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 MedusaSidecar/1",
+    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 CipherSidecar/1",
   });
   page.on("request", (req) => record(req, null));
   page.on("response", (res) => {
