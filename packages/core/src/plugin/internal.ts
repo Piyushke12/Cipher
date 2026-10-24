@@ -87,6 +87,34 @@ import { WebFetchTool } from "../tool/plugin/webfetch.js"
 import { WebSearchTool } from "../tool/plugin/websearch.js"
 import { WellKnown } from "../wellknown.js"
 import { WriteTool } from "../tool/plugin/write.js"
+import { AsnmapTool } from "../tool/plugin/security/asnmap.js"
+import { BrowserTool } from "../tool/plugin/security/browser.js"
+import { DnsxTool } from "../tool/plugin/security/dnsx.js"
+import { FfufTool } from "../tool/plugin/security/ffuf.js"
+import { GitleaksTool } from "../tool/plugin/security/gitleaks.js"
+import { GrypeTool } from "../tool/plugin/security/grype.js"
+import { HttpxTool } from "../tool/plugin/security/httpx.js"
+import { InteractshTool } from "../tool/plugin/security/interactsh.js"
+import { KatanaTool } from "../tool/plugin/security/katana.js"
+import { KubescapeTool } from "../tool/plugin/security/kubescape.js"
+import { MysqlTool } from "../tool/plugin/security/mysql.js"
+import { NaabuTool } from "../tool/plugin/security/naabu.js"
+import { NmapTool } from "../tool/plugin/security/nmap.js"
+import { NucleiTool } from "../tool/plugin/security/nuclei.js"
+import { PingcastleTool } from "../tool/plugin/security/pingcastle.js"
+import { PsqlTool } from "../tool/plugin/security/psql.js"
+import { RizinTool } from "../tool/plugin/security/rizin.js"
+import { SemgrepTool } from "../tool/plugin/security/semgrep.js"
+import { SqlmapTool } from "../tool/plugin/security/sqlmap.js"
+import { SubfinderTool } from "../tool/plugin/security/subfinder.js"
+import { SyftTool } from "../tool/plugin/security/syft.js"
+import { TcpdumpTool } from "../tool/plugin/security/tcpdump.js"
+import { TlsxTool } from "../tool/plugin/security/tlsx.js"
+import { TrivyImageTool } from "../tool/plugin/security/trivy-image.js"
+import { TrivyTool } from "../tool/plugin/security/trivy.js"
+import { TsharkTool } from "../tool/plugin/security/tshark.js"
+import { UncoverTool } from "../tool/plugin/security/uncover.js"
+import { ZapTool } from "../tool/plugin/security/zap.js"
 import { AgentPlugin } from "./agent.js"
 import BrowserPlugin from "@opencode/plugin-browser"
 import { CommandPlugin } from "./command.js"
@@ -249,6 +277,36 @@ const pre = [
   WebSearchTool.Plugin,
   WriteTool.Plugin,
   WarmingPlugin.Plugin,
+  // Cipher security tools: external security CLIs exposed as built-in tools, following the
+  // same leaf pattern as the tools above (resolve binary -> permission.assert -> spawn -> report).
+  AsnmapTool.Plugin,
+  BrowserTool.Plugin,
+  DnsxTool.Plugin,
+  FfufTool.Plugin,
+  GitleaksTool.Plugin,
+  GrypeTool.Plugin,
+  HttpxTool.Plugin,
+  InteractshTool.Plugin,
+  KatanaTool.Plugin,
+  KubescapeTool.Plugin,
+  MysqlTool.Plugin,
+  NaabuTool.Plugin,
+  NmapTool.Plugin,
+  NucleiTool.Plugin,
+  PingcastleTool.Plugin,
+  PsqlTool.Plugin,
+  RizinTool.Plugin,
+  SemgrepTool.Plugin,
+  SqlmapTool.Plugin,
+  SubfinderTool.Plugin,
+  SyftTool.Plugin,
+  TcpdumpTool.Plugin,
+  TlsxTool.Plugin,
+  TrivyImageTool.Plugin,
+  TrivyTool.Plugin,
+  TsharkTool.Plugin,
+  UncoverTool.Plugin,
+  ZapTool.Plugin,
 ] as const satisfies readonly InternalPlugin[]
 
 const post = [
