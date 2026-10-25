@@ -1,13 +1,31 @@
-<p align="center">
-  <a href="https://opencode.ai">
-    <picture>
-      <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
-      <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="OpenCode logo">
-    </picture>
-  </a>
-</p>
-<p align="center">The open source AI coding agent.</p>
+<div align="center">
+
+# 🛡️ Cipher
+
+**Autonomous Security Assessment Agent — a fork of OpenCode**
+
+*Authorized penetration testing & vulnerability assessment*
+
+</div>
+
+---
+
+## 📖 What this fork is
+
+This repository is [OpenCode](https://opencode.ai) (the open-source AI coding agent) forked and adapted into **Cipher**, an autonomous security-assessment agent. Instead of writing code, Cipher uses the same reasoning/tool-calling harness to discover, investigate, validate, and demonstrate security weaknesses across an authorized attack surface, and reports findings with evidence rather than speculation.
+
+This supersedes the earlier standalone Rust/Tauri prototype of Cipher (see the parent `Cipher` repo's `main` branch) — the harness going forward is this OpenCode fork, on the `dev` branch.
+
+## 🧩 What's built so far
+
+- **Rebrand**: TUI/CLI identity renamed from OpenCode to Cipher throughout.
+- **Custom offensive-security tools**: `http` (raw request/response inspection with large-body file-backing), `surface` (attack-surface/endpoint inventory), `websearch`/`searxng` (recon search), plus wrappers around `ffuf`, `nuclei`, `katana`, `exec`, and `shell` for black-box testing.
+- **System prompt**: rewritten for offensive security work — an evidence-first reasoning contract (established facts vs. hypotheses vs. tool interpretations) instead of a coding-assistant prompt, with a widened path for assessments that would otherwise get stuck declaring premature completion.
+- **Skill library** (`.opencode/skills/`): 20 on-demand skills covering IDOR/BOLA, SSRF, XXE, SQL/NoSQL injection, SSTI, file upload/LFI/RFI, command injection, XSS, prototype pollution, GraphQL abuse, mass assignment, business logic flaws, race conditions/TOCTOU, request smuggling & cache poisoning, CSRF/CORS, resource exhaustion (YAML/XML/ZIP bombs, ReDoS), authentication & session security (JWT forgery, OAuth/SAML misconfiguration, account takeover), supply-chain/dependency attacks, LLM application attacks (prompt injection), and Linux privilege escalation — each triggered automatically by the model via its own frontmatter description, no central dispatch table needed.
+
+---
+
+<p align="center">The open source AI coding agent this fork is built on.</p>
 <p align="center">
   <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/@opencode/cli"><img alt="npm" src="https://img.shields.io/npm/v/@opencode/cli?style=flat-square" /></a>
