@@ -36,7 +36,11 @@ const OS =
 const description = (shell?: string) =>
   [
     "Execute a shell command and return its output.",
-    ...(shell ? [`Commands run on ${OS} using ${shell}.`] : []),
+    ...(shell
+      ? [
+          `Commands run on ${OS} using ${shell}. Write the command/script body directly as the \`command\` string - the command already executes inside ${shell}, so invoking ${shell} again from within it is redundant and nests one layer of quoting/variable-escaping inside another, which reliably corrupts both.`,
+        ]
+      : []),
     "Quote file paths containing spaces or special characters.",
     "Prefer dedicated tools over shell commands when possible.",
     "When output is large, the full result is saved to a file and a truncated preview is returned.",

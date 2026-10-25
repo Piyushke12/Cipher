@@ -12,7 +12,7 @@ const DOCS_URL = "https://github.com/projectdiscovery/katana"
 
 export const Input = Schema.Struct({
   url: Schema.String.annotate({ description: "Starting URL to crawl." }),
-  depth: Schema.optionalKey(Schema.String).annotate({ description: "Max crawl depth. Defaults to 3." }),
+  depth: Schema.optionalKey(Schema.Number).annotate({ description: "Max crawl depth. Defaults to 3." }),
 })
 
 export const Output = SecurityExec.Output
@@ -37,13 +37,13 @@ export const Plugin = {
             if (!bin) return Effect.fail(SecurityExec.missingExecutableFailure(name, EXECUTABLES, DOCS_URL))
             const args = [
               "-u",
-              input.url,
+              SecurityExec.normalizeLocalhost(input.url),
               "-jsonl",
               "-silent",
               "-jc",
               "-kf",
               "all",
-              ...(input.depth ? ["-d", input.depth] : []),
+              ...(input.depth ? ["-d", String(input.depth)] : []),
             ]
             return SecurityExec.runTool({
               proc,

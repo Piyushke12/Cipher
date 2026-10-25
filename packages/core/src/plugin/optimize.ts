@@ -59,7 +59,11 @@ export const MetaPlugin = make("opencode.prompt.meta", (model) => {
   return PROMPT_META.replaceAll("{{MODEL_NAME}}", model.name)
 })
 
-export const Plugins = [OpenAIPlugin, AnthropicPlugin, KimiPlugin, ArceePlugin, MetaPlugin] as const
+// Cipher replaces OpenCode's persona entirely: none of the per-model-family
+// identity prompts above (which override `system.txt` for gpt/claude/kimi/
+// muse/trinity-family models) should fire. Keep the plugin definitions for
+// reference, but wire nothing in.
+export const Plugins = [] as const
 
 const models = new WeakMap<SessionHooks["context"], Model.Info>()
 

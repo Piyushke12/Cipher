@@ -54,8 +54,8 @@ import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginPromise } from "@opencode/core/plugin/promise"
-import { OptimizePlugin } from "@opencode/core/plugin/optimize"
 import { IdentityPlugin } from "@opencode/core/plugin/identity"
+import { Token } from "@opencode/core/util/token"
 import { QuestionTool } from "@opencode/core/tool/plugin/question"
 import { Agent } from "@opencode/core/agent"
 import { Config } from "@opencode/core/config"
@@ -115,13 +115,19 @@ const testModel = (id: string, limit: ModelLimit = defaultModelLimit) => {
 }
 const model = testModel("fake-model")
 const defaultSystem = SessionSystemPrompt.make([])
+// The system prompt spends context window before any history does. Context-sensitive
+// scenarios scale their window with it, so they keep testing history fitting instead
+// of how large the current system prompt happens to be.
+const systemTokens = Token.estimate(defaultSystem)
 const identity = (providerID: string, id: string) =>
   ["# Your Model", `- Name: ${id}`, `- Provider ID: ${providerID}`, `- Model ID: ${id}`].join("\n")
 const fakeIdentity = identity("fake", "fake-model")
 const replacementIdentity = identity("fake", "replacement")
 const gptIdentity = identity("openai", "gpt-5")
 const replacementModel = testModel("replacement")
-const compactModel = testModel("compact", { context: 4_000, output: 50 })
+const compactModel = testModel("compact", { context: 4_000 + systemTokens, output: 50 })
+// Reported usage that sits just under the compact model window, whatever the system prompt costs.
+const overLimit = Math.round((4_000 + systemTokens) * 0.9875)
 const fullOutputModel = testModel("full-output", { context: 262_144, output: 262_144 })
 const unknownContextModel = testModel("unknown-context", { context: 0, output: 32_000 })
 const undersizedContextModel = testModel("undersized-context", { context: 1, output: 1_000 })
@@ -532,9 +538,8 @@ const setup = Effect.gen(function* () {
     provider: noProviders,
     session: { hook: (name, callback) => hooks.register("session", name, callback) },
   })
-  yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), {
-    discard: true,
-  })
+  // OptimizePlugin.Plugins is intentionally empty (Cipher owns the persona
+  // for every model), so there is nothing to wire in here.
   yield* IdentityPlugin.Plugin.effect(pluginHost)
   yield* agents.transform((editor) => {
     editor.update(Agent.ID.make("build"), (agent) => {
@@ -1753,21 +1758,18 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, fakeIdentity, "Latest context"])
   })
 
-  scenario("uses the selected model family prompt when the agent does not override it", function* (s) {
+  scenario("keeps the Cipher system prompt when the agent does not override it", function* (s) {
     s.currentModel = LanguageModel.make({ id: "gpt-5", provider: "openai", route: OpenAIChat.route })
     yield* s.admit("First")
 
     yield* s.llm.push(TestLLM.text("Done", "text-provider-prompt"))
     yield* s.resume
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
-      expect.stringContaining("# Delegation"),
-      gptIdentity,
-      "Initial context",
-    ])
+    // Cipher owns the persona for every model, so no per-family prompt replaces it.
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, gptIdentity, "Initial context"])
   })
 
-  scenario("uses the selected model family prompt when the agent system override is empty", function* (s) {
+  scenario("keeps the Cipher system prompt when the agent system override is empty", function* (s) {
     s.currentModel = LanguageModel.make({ id: "gpt-5", provider: "openai", route: OpenAIChat.route })
     const agent = yield* Agent.Service
     yield* agent.transform((editor) =>
@@ -1781,11 +1783,7 @@ describe("SessionRunnerLLM", () => {
     yield* s.llm.push(TestLLM.text("Done", "text-empty-agent-system"))
     yield* s.resume
 
-    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([
-      expect.stringContaining("# Delegation"),
-      gptIdentity,
-      "Initial context",
-    ])
+    expect(s.requests.at(-1)?.system.map((part) => part.text)).toEqual([defaultSystem, gptIdentity, "Initial context"])
   })
 
   scenario("includes the effective default agent system before durable context", function* (s) {
@@ -2922,7 +2920,7 @@ describe("SessionRunnerLLM", () => {
     })
     yield* s.llm.push(TestLLM.text("Answer 0", "answer-0"))
     yield* s.resume
-    s.currentModel = testModel("smaller-history", { context: 7_000, output: 1_000 })
+    s.currentModel = testModel("smaller-history", { context: 7_000 + systemTokens, output: 1_000 })
     s.requests.length = 0
     yield* s.llm.push(TestLLM.text("## Objective\n- Recovered", "summary"))
     const compaction = yield* s.session.compact({ sessionID })
@@ -3052,7 +3050,7 @@ describe("SessionRunnerLLM", () => {
       ),
     )
     yield* Effect.forEach([0, 1], (index) => s.runPrompt(`Request ${index}`))
-    s.currentModel = testModel("smaller-history", { context: 7_000, output: 1_000 })
+    s.currentModel = testModel("smaller-history", { context: 7_000 + systemTokens, output: 1_000 })
     s.requests.length = 0
     yield* s.llm.push(TestLLM.text("## Objective\n- Recovered", "summary"))
     yield* s.session.compact({ sessionID })
@@ -3074,7 +3072,7 @@ describe("SessionRunnerLLM", () => {
       Array.from({ length: 16 }, (_, index) => index),
       (index) => s.runPrompt(`Request ${index}: ${"x".repeat(8_000)}`),
     )
-    s.currentModel = testModel("smaller-history", { context: 7_000, output: 1_000 })
+    s.currentModel = testModel("smaller-history", { context: 7_000 + systemTokens, output: 1_000 })
     s.requests.length = 0
     yield* s.llm.push(TestLLM.text("## Objective\n- Recovered", "summary"))
     const compaction = yield* s.session.compact({ sessionID })
@@ -3167,14 +3165,14 @@ describe("SessionRunnerLLM", () => {
 
   scenario("automatically compacts into a completed summary and retained recent turn", function* (s) {
     const store = yield* SessionStore.Service
-    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-first", 3_950))
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-first", overLimit))
     yield* s.runPrompt("Earlier question ".repeat(180))
 
     s.currentModel = compactModel
     s.requests.length = 0
     yield* s.llm.push(
       TestLLM.text("## Objective\n- Preserve the task", "text-summary"),
-      TestLLM.textWithUsage("Continued", "text-final", 3_950),
+      TestLLM.textWithUsage("Continued", "text-final", overLimit),
     )
     yield* s.runPrompt("Recent exact request ".repeat(180))
 
@@ -3326,7 +3324,7 @@ describe("SessionRunnerLLM", () => {
   })
 
   scenario("stops after required automatic compaction fails", function* (s) {
-    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-before-failed-compaction", 3_950))
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-before-failed-compaction", overLimit))
     yield* s.runPrompt("Earlier question ".repeat(180))
 
     s.currentModel = compactModel

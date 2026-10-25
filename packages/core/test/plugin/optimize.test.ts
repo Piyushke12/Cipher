@@ -46,9 +46,25 @@ const context = (id: string, system = fallback): SessionHooks["context"] => ({
   options: {},
 })
 
+// Cipher replaces OpenCode's persona for every model; none of the per-model
+// identity prompts below are wired into the live app (`OptimizePlugin.Plugins`
+// is empty). These tests exercise the individual plugin exports directly to
+// confirm they still behave correctly in isolation, should they ever be needed.
+const allPrompts = [
+  OptimizePlugin.OpenAIPlugin,
+  OptimizePlugin.AnthropicPlugin,
+  OptimizePlugin.KimiPlugin,
+  OptimizePlugin.ArceePlugin,
+  OptimizePlugin.MetaPlugin,
+]
+
 describe("OptimizePlugin", () => {
-  test("enables prompt plugins without model-specific tool optimization", () => {
-    expect(OptimizePlugin.Plugins.map((plugin) => plugin.id)).toEqual([
+  test("is not wired into the live plugin registry", () => {
+    expect(OptimizePlugin.Plugins).toEqual([])
+  })
+
+  test("defines prompt plugins without model-specific tool optimization", () => {
+    expect(allPrompts.map((plugin) => plugin.id)).toEqual([
       "opencode.prompt.openai",
       "opencode.prompt.anthropic",
       "opencode.prompt.kimi",
@@ -69,7 +85,7 @@ describe("OptimizePlugin", () => {
           model.name = "Muse Spark"
         })
       })
-      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), {
+      yield* Effect.forEach(allPrompts, (plugin) => plugin.effect(pluginHost), {
         discard: true,
       })
       const cases = [
@@ -270,7 +286,7 @@ describe("OptimizePlugin", () => {
         }),
       )
       const pluginHost = yield* makeHost
-      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), {
+      yield* Effect.forEach(allPrompts, (plugin) => plugin.effect(pluginHost), {
         discard: true,
       })
       const event = context("gpt-5", "Custom agent prompt")
@@ -339,7 +355,7 @@ describe("OptimizePlugin", () => {
             if (family) model.family = Model.Family.make(family)
           })
       })
-      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), { discard: true })
+      yield* Effect.forEach(allPrompts, (plugin) => plugin.effect(pluginHost), { discard: true })
       yield* Effect.forEach(
         cases,
         ([id, , , prompt]) =>
@@ -375,7 +391,7 @@ describe("OptimizePlugin", () => {
           model.name = "Muse Spark"
         })
       })
-      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), { discard: true })
+      yield* Effect.forEach(allPrompts, (plugin) => plugin.effect(pluginHost), { discard: true })
       yield* IdentityPlugin.Plugin.effect(pluginHost)
 
       const named = context("meta/muse-spark-1.1")

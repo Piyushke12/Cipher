@@ -93,6 +93,7 @@ import { DnsxTool } from "../tool/plugin/security/dnsx.js"
 import { FfufTool } from "../tool/plugin/security/ffuf.js"
 import { GitleaksTool } from "../tool/plugin/security/gitleaks.js"
 import { GrypeTool } from "../tool/plugin/security/grype.js"
+import { HttpTool } from "../tool/plugin/security/http.js"
 import { HttpxTool } from "../tool/plugin/security/httpx.js"
 import { InteractshTool } from "../tool/plugin/security/interactsh.js"
 import { KatanaTool } from "../tool/plugin/security/katana.js"
@@ -107,6 +108,7 @@ import { RizinTool } from "../tool/plugin/security/rizin.js"
 import { SemgrepTool } from "../tool/plugin/security/semgrep.js"
 import { SqlmapTool } from "../tool/plugin/security/sqlmap.js"
 import { SubfinderTool } from "../tool/plugin/security/subfinder.js"
+import { SurfaceTool } from "../tool/plugin/security/surface.js"
 import { SyftTool } from "../tool/plugin/security/syft.js"
 import { TcpdumpTool } from "../tool/plugin/security/tcpdump.js"
 import { TlsxTool } from "../tool/plugin/security/tlsx.js"
@@ -285,6 +287,7 @@ const pre = [
   FfufTool.Plugin,
   GitleaksTool.Plugin,
   GrypeTool.Plugin,
+  HttpTool.Plugin,
   HttpxTool.Plugin,
   InteractshTool.Plugin,
   KatanaTool.Plugin,
@@ -299,6 +302,7 @@ const pre = [
   SemgrepTool.Plugin,
   SqlmapTool.Plugin,
   SubfinderTool.Plugin,
+  SurfaceTool.Plugin,
   SyftTool.Plugin,
   TcpdumpTool.Plugin,
   TlsxTool.Plugin,

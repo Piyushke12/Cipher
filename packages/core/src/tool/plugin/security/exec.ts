@@ -17,6 +17,17 @@ export const Output = Schema.Struct({
   truncated: Schema.Boolean,
 })
 
+/**
+ * projectdiscovery's tools (httpx, katana, nuclei, ffuf's DNS-less path works fine, but the
+ * shared resolver underneath httpx/katana/nuclei) resolve the literal hostname "localhost"
+ * unreliably on this host - httpx fails outright, katana only intermittently. Rewrite a bare
+ * "localhost" host component to "127.0.0.1", which both resolves correctly and is what a user
+ * means by "localhost" in practice.
+ */
+export function normalizeLocalhost(value: string) {
+  return value.replace(/^(https?:\/\/)?localhost(?=[:/]|$)/i, "$1127.0.0.1")
+}
+
 /** First PATH match from a list of candidate executable names, or undefined. */
 export function resolveExecutable(candidates: readonly string[]) {
   for (const candidate of candidates) {

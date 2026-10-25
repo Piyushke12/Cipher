@@ -37,7 +37,7 @@ export const Plugin = {
             if (!bin) return Effect.fail(SecurityExec.missingExecutableFailure(name, EXECUTABLES, DOCS_URL))
             const args = [
               "-u",
-              input.url,
+              SecurityExec.normalizeLocalhost(input.url),
               "-json",
               "-silent",
               "-follow-redirects",

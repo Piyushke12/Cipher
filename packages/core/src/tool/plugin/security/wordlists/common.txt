@@ -19,4 +19,12 @@ login.php
 admin.php
 api/v1
 v1/api
+.well-known/jwks.json
+jwks.json
+public.pem
+public.key
+cert.pem
+server.pem
+keys
+certs
 FUZZ

@@ -35,7 +35,6 @@ import { McpInstructions } from "@opencode/core/mcp/instructions"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
-import { OptimizePlugin } from "@opencode/core/plugin/optimize"
 import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { describe, expect } from "bun:test"
 import { eq } from "drizzle-orm"
@@ -188,7 +187,8 @@ describe("SessionRunnerLLM recorded", () => {
         provider: noProviders,
         session: { hook: (name, callback) => hooks.register("session", name, callback) },
       })
-      yield* Effect.forEach(OptimizePlugin.Plugins, (plugin) => plugin.effect(pluginHost), { discard: true })
+      // OptimizePlugin.Plugins is intentionally empty (Cipher owns the persona
+      // for every model), so there is nothing to wire in here.
       yield* IdentityPlugin.Plugin.effect(pluginHost)
       const { db } = yield* Database.Service
       yield* db
