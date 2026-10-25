@@ -1,132 +1,104 @@
 <div align="center">
 
-# 🛡️ Cipher
+<h1>
+  🛡️&nbsp;<span style="font-size:1.4em;letter-spacing:0.02em;">Cipher</span>
+</h1>
 
-**Autonomous Security Assessment Agent — a fork of OpenCode**
+**Autonomous Security Assessment Agent**
 
 *Authorized penetration testing & vulnerability assessment*
+
+[![Build status](https://img.shields.io/badge/build-passing-brightgreen?style=flat-square)]()
+[![License](https://img.shields.io/badge/license-proprietary-blue?style=flat-square)]()
 
 </div>
 
 ---
 
-## 📖 What this fork is
+## 📖 Overview
 
-This repository is [OpenCode](https://opencode.ai) (the open-source AI coding agent) forked and adapted into **Cipher**, an autonomous security-assessment agent. Instead of writing code, Cipher uses the same reasoning/tool-calling harness to discover, investigate, validate, and demonstrate security weaknesses across an authorized attack surface, and reports findings with evidence rather than speculation.
+**Cipher** is an autonomous security-assessment agent. Point it at an authorized target and it discovers, investigates, validates, and demonstrates security weaknesses the way an experienced offensive-security professional would — reasoning from observed evidence rather than guesswork, and reporting findings with proof instead of speculation.
 
-This supersedes the earlier standalone Rust/Tauri prototype of Cipher (see the parent `Cipher` repo's `main` branch) — the harness going forward is this OpenCode fork, on the `dev` branch.
+Each step in an assessment asks:
+1. What important facts are established?
+2. What important security questions remain unanswered?
+3. What attack paths are currently plausible?
+4. Did the latest action reveal a new identity, privilege, resource, endpoint, API, or trust boundary?
+5. Which capability would reduce the most important uncertainty?
+6. Are prerequisites satisfied?
+7. Is the expected information/security value worth the cost/risk?
+8. If useful, execute the capability. If no meaningful safe investigation remains, propose completion.
 
-## 🧩 What's built so far
+**Core principles**
+- Capabilities are instruments, not a checklist — never run a tool merely because it's available.
+- Evidence hierarchy: observed facts > tool interpretations > hypotheses. Hypotheses are never presented as fact.
+- When evidence supports a credible vulnerability, validate it and pursue meaningful impact when authorized and safe.
+- When an action changes identity or privilege, reason about the newly reachable surface before continuing.
 
-- **Rebrand**: TUI/CLI identity renamed from OpenCode to Cipher throughout.
-- **Custom offensive-security tools**: `http` (raw request/response inspection with large-body file-backing), `surface` (attack-surface/endpoint inventory), `websearch`/`searxng` (recon search), plus wrappers around `ffuf`, `nuclei`, `katana`, `exec`, and `shell` for black-box testing.
-- **System prompt**: rewritten for offensive security work — an evidence-first reasoning contract (established facts vs. hypotheses vs. tool interpretations) instead of a coding-assistant prompt, with a widened path for assessments that would otherwise get stuck declaring premature completion.
-- **Skill library** (`.opencode/skills/`): 20 on-demand skills covering IDOR/BOLA, SSRF, XXE, SQL/NoSQL injection, SSTI, file upload/LFI/RFI, command injection, XSS, prototype pollution, GraphQL abuse, mass assignment, business logic flaws, race conditions/TOCTOU, request smuggling & cache poisoning, CSRF/CORS, resource exhaustion (YAML/XML/ZIP bombs, ReDoS), authentication & session security (JWT forgery, OAuth/SAML misconfiguration, account takeover), supply-chain/dependency attacks, LLM application attacks (prompt injection), and Linux privilege escalation — each triggered automatically by the model via its own frontmatter description, no central dispatch table needed.
-
----
-
-<p align="center">The open source AI coding agent this fork is built on.</p>
-<p align="center">
-  <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/@opencode/cli"><img alt="npm" src="https://img.shields.io/npm/v/@opencode/cli?style=flat-square" /></a>
-  <a href="https://github.com/anomalyco/opencode/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/publish.yml?style=flat-square&branch=dev" /></a>
-</p>
-
-<p align="center">
-  <a href="README.md">English</a> |
-  <a href="README.zh.md">简体中文</a> |
-  <a href="README.zht.md">繁體中文</a> |
-  <a href="README.ko.md">한국어</a> |
-  <a href="README.de.md">Deutsch</a> |
-  <a href="README.es.md">Español</a> |
-  <a href="README.fr.md">Français</a> |
-  <a href="README.it.md">Italiano</a> |
-  <a href="README.da.md">Dansk</a> |
-  <a href="README.ja.md">日本語</a> |
-  <a href="README.pl.md">Polski</a> |
-  <a href="README.ru.md">Русский</a> |
-  <a href="README.bs.md">Bosanski</a> |
-  <a href="README.ar.md">العربية</a> |
-  <a href="README.no.md">Norsk</a> |
-  <a href="README.br.md">Português (Brasil)</a> |
-  <a href="README.th.md">ไทย</a> |
-  <a href="README.tr.md">Türkçe</a> |
-  <a href="README.uk.md">Українська</a> |
-  <a href="README.bn.md">বাংলা</a> |
-  <a href="README.gr.md">Ελληνικά</a> |
-  <a href="README.vi.md">Tiếng Việt</a>
-</p>
-
-[![OpenCode Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://opencode.ai)
+The goal is not to maximize the number of tools run, but to determine how far an attacker could realistically compromise the authorized system, and to produce strong evidence of that.
 
 ---
 
-### Installation
+## 🧰 Capabilities
+
+- **Offensive-security tools**: raw HTTP request/response inspection, attack-surface/endpoint inventory (robots.txt, sitemaps, OpenAPI specs, JS bundle analysis), recon search, and wrappers around `ffuf`, `nuclei`, `katana`, `exec`, and `shell` for black-box testing.
+- **Evidence-first reasoning**: an assessment system prompt that separates established facts from hypotheses and tool interpretations, with explicit scope/authorization and prompt-injection guardrails.
+- **Skill library**: 20 on-demand skills that load automatically when relevant, covering IDOR/BOLA, SSRF, XXE, SQL/NoSQL injection, SSTI, file upload/LFI/RFI, command injection, XSS, prototype pollution, GraphQL abuse, mass assignment, business logic flaws, race conditions/TOCTOU, request smuggling & cache poisoning, CSRF/CORS, resource exhaustion (YAML/XML/ZIP bombs, ReDoS), authentication & session security (JWT forgery, OAuth/SAML misconfiguration, account takeover), supply-chain/dependency attacks, LLM application attacks, and Linux privilege escalation.
+- **Terminal UI** with a `build`/`plan` agent toggle and a `general` subagent for complex multi-step searches.
+
+---
+
+## 🚀 Running Locally
+
+### Prerequisites
+
+- [Bun](https://bun.sh) 1.4.4 or later
+- Git
+
+### Setup
 
 ```bash
-# YOLO
-curl -fsSL https://opencode.ai/v2/install | bash
+git clone <this-repository-url>
+cd opencode
+bun install
+```
 
-# Package managers
-npm i -g @opencode/cli@latest      # or bun/pnpm/yarn
-brew install anomalyco/tap/opencode-v2 # macOS and Linux (recommended, always up to date)
-brew install opencode              # macOS and Linux (official brew formula, updated less)
-sudo pacman -S opencode            # Arch Linux (Stable)
-paru -S opencode-beta              # Arch Linux (Latest from AUR)
-mise use -g opencode               # Any OS
-nix run github:anomalyco/opencode  # Nix
+### Start the agent
+
+```bash
+# Launch the TUI against the current directory
+bun run dev
+
+# Launch it against a specific project/target directory
+bun run dev /path/to/project
 ```
 
 > [!TIP]
-> Remove versions older than 0.1.x before installing.
+> If you already have a Cipher background service running and just want to attach a dev build of the TUI to it, use `bun run dev:live` instead — it discovers the running service and reuses its session/storage channel.
 
-### Desktop App (BETA)
-
-OpenCode is also available as a desktop application. Download it from [opencode.ai/download](https://opencode.ai/download).
-
-| Platform              | Download                           |
-| --------------------- | ---------------------------------- |
-| macOS (Apple Silicon) | `opencode-desktop-mac-arm64.dmg`   |
-| macOS (Intel)         | `opencode-desktop-mac-x64.dmg`     |
-| Windows               | `opencode-desktop-win-x64.exe`     |
-| Linux                 | `.deb`, `.rpm`, or `.AppImage`     |
+### Verify your setup
 
 ```bash
-# macOS (Homebrew)
-brew install --cask opencode-desktop
+bun run typecheck   # from a package directory, e.g. packages/core
+bun run check       # full lint + typecheck from the repo root
 ```
-
-#### Installation Directory
-
-The install script installs OpenCode to `$HOME/.opencode/bin`.
-
-### Agents
-
-OpenCode includes two built-in agents you can switch between with the `Tab` key.
-
-- **build** - Default, full-access agent for development work
-- **plan** - Read-only agent for analysis and code exploration
-  - Denies file edits by default
-  - Asks permission before running bash commands
-  - Ideal for exploring unfamiliar codebases or planning changes
-
-Also included is a **general** subagent for complex searches and multistep tasks.
-This is used internally and can be invoked using `@general` in messages.
-
-Learn more about [agents](https://opencode.ai/v2/docs/agents).
-
-### Documentation
-
-For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/v2/docs).
-
-### Contributing
-
-If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
-
-### Building on OpenCode
-
-If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
 
 ---
 
-**Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
+## 🤖 Agents
+
+Cipher includes two built-in agents you can switch between with the `Tab` key:
+
+- **build** — default, full-access agent for running an assessment end-to-end
+- **plan** — read-only agent for analysis and recon
+  - Denies file edits by default
+  - Asks permission before running shell commands
+  - Ideal for scoping an engagement before taking action
+
+Also included is a **general** subagent for complex searches and multi-step tasks, invoked internally or explicitly with `@general` in messages.
+
+---
+
+## 🛠️ Development
+
+See [AGENTS.md](./AGENTS.md) for repository conventions (branch naming, commit style, code style, and testing). See [CONTRIBUTING.md](./CONTRIBUTING.md) for the contribution workflow.
