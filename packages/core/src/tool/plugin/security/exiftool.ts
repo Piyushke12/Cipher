@@ -1,4 +1,4 @@
-export * as MetadataTool from "./metadata.js"
+export * as ExiftoolTool from "./exiftool.js"
 
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { ToolFailure } from "@opencode/ai"
@@ -16,7 +16,7 @@ import { RelativePath } from "../../../schema.js"
 import { collectBoundedResponseBody } from "../../http-body.js"
 import { SecurityExec } from "./exec.js"
 
-export const name = "metadata"
+export const name = "exiftool"
 const EXECUTABLES = ["exiftool"]
 const DOCS_URL = "https://exiftool.org/"
 const MAX_DOWNLOAD_BYTES = 50_000_000
@@ -53,7 +53,7 @@ const downloadToTemp = (http: HttpClient.HttpClient, url: string) =>
       MAX_DOWNLOAD_BYTES,
       () => new Error(`Download exceeds the ${MAX_DOWNLOAD_BYTES}-byte limit for this tool.`),
     )
-    const dir = yield* Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-metadata-")))
+    const dir = yield* Effect.promise(() => mkdtemp(path.join(os.tmpdir(), "opencode-exiftool-")))
     const file = path.join(dir, randomUUID())
     yield* Effect.promise(() => writeFile(file, bytes))
     return { file, dir }
@@ -99,8 +99,8 @@ const runExiftool = (proc: AppProcess.Interface, bin: string, filePath: string) 
   })
 
 export const Plugin = {
-  id: "opencode.tool.security.metadata",
-  effect: Effect.fn("MetadataTool.Plugin")(function* (ctx: Context) {
+  id: "opencode.tool.security.exiftool",
+  effect: Effect.fn("ExiftoolTool.Plugin")(function* (ctx: Context) {
     const proc = yield* AppProcess.Service
     const permission = yield* Permission.Service
     const access = yield* FileAccess.Service

@@ -90,6 +90,7 @@ import { WriteTool } from "../tool/plugin/write.js"
 import { AsnmapTool } from "../tool/plugin/security/asnmap.js"
 import { BrowserTool } from "../tool/plugin/security/browser.js"
 import { DnsxTool } from "../tool/plugin/security/dnsx.js"
+import { ExiftoolTool } from "../tool/plugin/security/exiftool.js"
 import { FfufTool } from "../tool/plugin/security/ffuf.js"
 import { GitleaksTool } from "../tool/plugin/security/gitleaks.js"
 import { GrypeTool } from "../tool/plugin/security/grype.js"
@@ -98,7 +99,6 @@ import { HttpxTool } from "../tool/plugin/security/httpx.js"
 import { InteractshTool } from "../tool/plugin/security/interactsh.js"
 import { KatanaTool } from "../tool/plugin/security/katana.js"
 import { KubescapeTool } from "../tool/plugin/security/kubescape.js"
-import { MetadataTool } from "../tool/plugin/security/metadata.js"
 import { MysqlTool } from "../tool/plugin/security/mysql.js"
 import { NaabuTool } from "../tool/plugin/security/naabu.js"
 import { NmapTool } from "../tool/plugin/security/nmap.js"
@@ -285,6 +285,7 @@ const pre = [
   AsnmapTool.Plugin,
   BrowserTool.Plugin,
   DnsxTool.Plugin,
+  ExiftoolTool.Plugin,
   FfufTool.Plugin,
   GitleaksTool.Plugin,
   GrypeTool.Plugin,
@@ -293,7 +294,6 @@ const pre = [
   InteractshTool.Plugin,
   KatanaTool.Plugin,
   KubescapeTool.Plugin,
-  MetadataTool.Plugin,
   MysqlTool.Plugin,
   NaabuTool.Plugin,
   NmapTool.Plugin,

@@ -1,6 +1,6 @@
 ---
 name: Metadata & Asset Recon
-description: Inspect embedded file metadata (EXIF, author/software tags, GPS, comments) with the `metadata` tool, and treat unusual-looking catalog items, attachments, and exports as recon targets rather than skipping them. Use whenever a challenge/task description names a file type or property ("blueprint", "hidden message", "original photo", "the export") instead of a literal filename, or when a target serves user- or product-uploaded assets.
+description: Inspect embedded file metadata (EXIF, author/software tags, GPS, comments) with the `exiftool` tool, and treat unusual-looking catalog items, attachments, and exports as recon targets rather than skipping them. Use whenever a challenge/task description names a file type or property ("blueprint", "hidden message", "original photo", "the export") instead of a literal filename, or when a target serves user- or product-uploaded assets.
 ---
 
 # Metadata & Asset Recon
@@ -13,13 +13,13 @@ Concretely: before giving up on "I can't find file X", enumerate what's actually
 ## Metadata is itself an attack surface
 Images, PDFs, Office documents, and many other formats carry metadata the uploader didn't intend to expose or didn't know was there: camera/software identifiers, GPS coordinates, author/owner names, revision history, comments, and free-text fields a developer sometimes (ab)uses to stash a hint, a credential, or an internal note. An asset that looks like an ordinary product photo or export can be the actual vector - metadata inspection is a cheap, high-signal step and should be routine for any downloadable file encountered during recon, not just ones that already look suspicious.
 
-Run the `metadata` tool (wraps `exiftool`) against:
+Run the `exiftool` tool against:
 - Product/catalog images and attachments, especially ones that stand out as unusual relative to the rest of a catalog (an odd format among JPEGs, an oddly large or small file, an item with no obvious purpose)
 - User-uploaded avatars, documents, and exports
 - Any file a task description characterizes by *type or property* ("the original", "the design file", "a backup") rather than by name
 - Files downloaded during `surface`/`ffuf` asset discovery before deciding they're uninteresting
 
-`metadata` takes either a `url` (it downloads the file itself) or a local `path`, and returns every embedded tag plus a `Notable tags` callout for fields matching GPS/software/comment/author/creator/owner/hint/description/user/copyright - read those first.
+`exiftool` takes either a `url` (it downloads the file itself) or a local `path`, and returns every embedded tag plus a `Notable tags` callout for fields matching GPS/software/comment/author/creator/owner/hint/description/user/copyright - read those first.
 
 ## Signals that a catalog/listing is worth a closer look
 - An item whose name, description, or image is subtly out of place next to its neighbors (different format, odd phrasing, a product that doesn't quite fit the catalog's theme)
@@ -30,12 +30,12 @@ Don't filter "weird-looking" entries out as noise; they are disproportionately l
 
 ## Workflow
 1. Enumerate real candidates: browse the catalog/listing UI and its backing API, and cross-reference `surface`'s discovered paths - don't rely on guessed literal names.
-2. For each plausible candidate (especially anything unusual per the signals above), download and run `metadata` on it.
+2. For each plausible candidate (especially anything unusual per the signals above), download and run `exiftool` on it.
 3. Read the `Notable tags` first; then scan the full tag list for anything that reads as a hint, path, name, or credential rather than routine camera/software boilerplate.
 4. If metadata points at a format, tool, or keyword (e.g. a CAD/3D tool name), use that as a pivot - it often names the exact file type or generator the task is actually about.
 
 ## Tools
-- `metadata` - EXIF/embedded-metadata extraction from a URL or local file
+- `exiftool` - EXIF/embedded-metadata extraction from a URL or local file
 - `surface` - build the path/asset inventory first so "candidates" isn't just what the UI shows
 - `ffuf` - confirm or rule out guessed literal filenames quickly, but only as a supplement to real enumeration, never as the primary method
 - `http` - fetch a candidate asset/catalog page directly when the UI paginates or lazy-loads
