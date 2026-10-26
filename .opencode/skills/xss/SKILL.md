@@ -25,6 +25,12 @@ Seeing your payload appear verbatim in HTML source is not confirmation - the bro
 - **Polyglot payloads** that execute whether they land in an HTML, attribute, or JS-string context - useful for a first probe across many fields before refining to the exact context.
 - **Mutation XSS (mXSS)**: some sanitizers parse-then-serialize HTML in a way that a payload can be inert as submitted but becomes executable once the browser's own parser re-interprets the sanitizer's *output* - worth a look specifically when a well-known sanitizer library is in use and straightforward payloads are all blocked.
 
+## Non-HTML rendering contexts carry XSS too
+Don't restrict testing to pages that obviously render user text. Any file format a browser or a library *parses and renders* inside the app can be a sink:
+- **Video/audio captions (WebVTT/SRT)**: a subtitle/caption track is plain text the browser cue-renders - some players/markup paths allow HTML inside a cue (e.g. a `<script>`-closing sequence like `</script><script>alert(1)</script>` placed in a cue line, or an `<iframe>` tag) to break out of the intended text context. If the app lets you upload or reference a caption/subtitle file for a video it renders, treat that file's content as an injection point exactly like a comment field.
+- **SVG**: uploaded/rendered SVGs execute script via `<script>`, `onload` on `<svg>`/`<image>`, or `xlink:href="javascript:..."` - treat any endpoint that accepts or displays user-supplied SVG as a stored-XSS sink, not just an image.
+- Any other client-parsed markup format the app accepts (Markdown renderers, custom templating previews) deserves the same HTML-body-context payloads as a comment field.
+
 ## Tools
 - `browser` to verify actual execution (not just reflection) and to interact with rendered pages for DOM-based cases
 - `http`/`shell`+curl for fast payload iteration across reflected contexts before confirming in a real browser

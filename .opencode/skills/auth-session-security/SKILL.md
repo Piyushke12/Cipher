@@ -29,6 +29,7 @@ Test in this order, against a normal authenticated endpoint and against the targ
 2. **Claim trust**: if any route reads role/id from an unverified `decode()` rather than `verify()`, or accepts an identity field in the body, forge/tamper the claim and skip signatures entirely.
 3. **Algorithm confusion**: sign HS256 using the exact bytes of the RSA **public** key as the HMAC secret. PEM whitespace matters - try the file content exactly, then trimmed, then the base64 body only.
 4. **Weak HMAC secret** if the app signs symmetric tokens with a password-like string (try values from source/config).
+5. **`kid` injection**: if the verifier resolves the signing key from the `kid` header at all (reads a file/DB row/URL named by it), you control which key verifies your forged token. Try path traversal (`kid: "../../../../dev/null"` paired with an empty-string HMAC secret - `/dev/null` reads as empty on Linux targets), pointing `kid` at a file whose exact content you already know (a static asset you can fetch, or one you can upload/control, e.g. an avatar) and signing HS256 with that file's bytes as the secret, or (if `kid` is a URL/JWKS reference) pointing it at a JWKS you host with your own keypair.
 
 Version signals matter: older JWT libraries (roughly `jsonwebtoken < 9`, `jws < 3`, `express-jwt < 6`) are the usual reason 1-2 work.
 
